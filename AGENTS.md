@@ -95,7 +95,7 @@ Usually nothing to do: the catalog comes from `ListAvailableModels` at runtime. 
 
 ## Releasing
 
-Tag `vX.Y.Z` matching `package.json`. `.github/workflows/release.yml` verifies, pushes `release/vX.Y.Z` (tag + built `dist/`, which pi git installs need), and creates the GitHub Release. Run tests with `KIRO_PROFILE_ARN` unset — `test/setup.ts` clears it.
+Tag `vX.Y.Z` matching `package.json`. `.github/workflows/release.yml` verifies, pushes `release/vX.Y.Z` (tag + built `dist/`, which pi git installs need), moves `release/latest` there when it is the highest version (pi's default install source, so `pi update` follows it), and creates the GitHub Release. omp is pointed at the newest exact tag instead: Bun caches git branch heads, so `omp plugin upgrade` never advances a branch install. Run tests with `KIRO_PROFILE_ARN` unset — `test/setup.ts` clears it.
 
 ## Common Gotchas
 

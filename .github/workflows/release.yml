@@ -4,6 +4,9 @@ name: Release
 #   - `release/vX.Y.Z`: the same tree plus the built `dist/`, which is what
 #     `pi install git:…@release/vX.Y.Z` clones (pi runs `dist/index.js` and git
 #     installs never run the build).
+#   - `release/latest`: moved to `release/vX.Y.Z` when this is the highest
+#     version released so far, so `pi update` on an unpinned install lands on
+#     the newest release. Re-releasing an older patch never moves it back.
 #   - A GitHub Release with the npm tarball and the install script attached.
 #   - npm, only when the repository variable NPM_PUBLISH is "true".
 
@@ -65,22 +68,19 @@ jobs:
           [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
           cat >> notes.md <<EOF
 
-          ## Install
+          ## Install or update (always the newest release)
 
-          **Oh My Pi**
           \`\`\`bash
-          omp plugin install github:${GITHUB_REPOSITORY}#${GITHUB_REF_NAME}
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | bash
           \`\`\`
 
-          **pi**
+          ## Pin exactly this release
+
           \`\`\`bash
-          pi install git:github.com/${GITHUB_REPOSITORY}@release/${GITHUB_REF_NAME}
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | bash -s -- --version ${GITHUB_REF_NAME}
           \`\`\`
 
-          **Both, via the installer**
-          \`\`\`bash
-          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/scripts/install.sh | bash -s -- --version ${GITHUB_REF_NAME}
-          \`\`\`
+          Or directly: \`omp plugin install github:${GITHUB_REPOSITORY}#${GITHUB_REF_NAME}\` · \`pi install git:github.com/${GITHUB_REPOSITORY}@release/${GITHUB_REF_NAME}\`
           EOF
 
       - name: Create GitHub Release
@@ -93,6 +93,15 @@ jobs:
             --verify-tag \
             "${{ steps.pack.outputs.tarball }}" \
             scripts/install.sh
+
+      - name: Move release/latest
+        run: |
+          newest="$(git tag --list 'v*.*.*' --sort=-version:refname | head -n 1)"
+          if [ "${newest}" != "${GITHUB_REF_NAME}" ]; then
+            echo "${GITHUB_REF_NAME} is not the newest release (${newest}); release/latest stays put"
+            exit 0
+          fi
+          git push --force origin "release/${GITHUB_REF_NAME}:refs/heads/release/latest"
 
       - name: Publish to npm
         if: vars.NPM_PUBLISH == 'true'

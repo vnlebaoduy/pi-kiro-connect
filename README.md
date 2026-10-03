@@ -8,44 +8,56 @@ Kiro (AWS CodeWhisperer / Amazon Q) provider for [pi](https://github.com/badlogi
 
 > Forked from [mikeyobrien/pi-provider-kiro](https://github.com/mikeyobrien/pi-provider-kiro) (MIT). See [NOTICE](NOTICE) for attribution. This is an unofficial project, not affiliated with Amazon or Kiro.
 
-## Install
-
-### One command (pi, omp, or both)
+## Install — always the newest release
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vnlebaoduy/pi-kiro-connect/main/scripts/install.sh | bash
 ```
 
-The installer installs the latest release into every host it finds on `PATH` and removes `pi-provider-kiro` if it is installed, because both register the same `kiro` provider. Options:
+This one command installs the newest release into every host on your `PATH`, pi and/or Oh My Pi. It also removes `pi-provider-kiro` if present, because both packages register the same `kiro` provider.
+
+## Update — always to the newest release
+
+| Host | Command |
+|---|---|
+| pi + omp | Rerun the install command above |
+| pi only | `pi update --extensions` |
+| omp only | `curl -fsSL https://raw.githubusercontent.com/vnlebaoduy/pi-kiro-connect/main/scripts/install.sh \| bash -s -- --omp` |
+
+Restart pi or omp afterwards.
+
+How each host stays current:
+
+- **pi** installs from the `release/latest` branch. Every release moves that branch to the newest version together with its prebuilt `dist/`, so `pi update --extensions` always lands on the newest release.
+- **omp** installs the exact newest tag, for example `#v0.13.1`. omp's own `omp plugin upgrade` does not pick up new commits on a branch, because Bun caches git heads. Rerunning the installer looks up the newest tag and reinstalls, which always works.
+
+## Installer options
 
 | Flag | Effect |
 |---|---|
-| `--version v0.13.1` | Install a specific release |
-| `--pi` / `--omp` | Install into one host only |
+| *(none)* | Newest release into every detected host |
+| `--pi` / `--omp` | One host only |
+| `--version v0.13.1` | Pin a specific release; it will not follow newer ones |
 | `--uninstall` | Remove pi-kiro-connect |
 
-To read the script before running it, download it first:
+Pass flags through the pipe with `bash -s --`, for example `curl -fsSL …/install.sh | bash -s -- --omp`. To read the script before running it:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/vnlebaoduy/pi-kiro-connect/main/scripts/install.sh
 less install.sh && bash install.sh
 ```
 
-### Oh My Pi
+### Without the installer
 
 ```bash
+# pi: follows the newest release; `pi update --extensions` updates it
+pi install git:github.com/vnlebaoduy/pi-kiro-connect@release/latest
+
+# omp: install the newest tag (see Releases); install a newer tag to update
 omp plugin install github:vnlebaoduy/pi-kiro-connect#v0.13.1
 ```
 
-omp installs with Bun and loads `src/index.ts` directly, so it needs no build step. To update, run the same command with a newer tag.
-
-### pi
-
-```bash
-pi install git:github.com/vnlebaoduy/pi-kiro-connect@release/v0.13.1
-```
-
-A git install in pi only runs `npm install` and never the build, while pi loads `dist/index.js`. For that reason every release publishes a `release/vX.Y.Z` branch that is the tag plus the prebuilt `dist/`. Always pin pi to one of those branches, not to the plain tag or to `main`.
+pi git installs never run the build, but pi loads `dist/index.js`. Point pi at a `release/…` branch, never at a plain tag or `main`, because only the release branches contain `dist/`.
 
 ### From source
 
@@ -146,7 +158,7 @@ Each feature lives in its own file under `src/`, with a matching test in `test/`
 
 1. Bump the version with `npm version <patch|minor|major> --no-git-tag-version` and add a `## [x.y.z]` section to `CHANGELOG.md`.
 2. Commit, then `git tag vX.Y.Z && git push origin main vX.Y.Z`.
-3. The [Release workflow](.github/workflows/release.yml) runs check, test and build, pushes `release/vX.Y.Z` with `dist/`, and creates the GitHub Release with the tarball and the installer attached. npm publishing runs only when the repository variable `NPM_PUBLISH` is `true`.
+3. The [Release workflow](.github/workflows/release.yml) runs check, test and build. It then pushes `release/vX.Y.Z` with `dist/`, moves `release/latest` to that branch if this is the highest version, and creates the GitHub Release with the tarball and the installer attached. npm publishing runs only when the repository variable `NPM_PUBLISH` is `true`.
 
 ## License
 

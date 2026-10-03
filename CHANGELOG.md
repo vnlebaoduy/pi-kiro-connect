@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-10-03
+
+### Changed
+
+- Installs follow the newest release by default. Every release moves a `release/latest` branch (newest tag plus prebuilt `dist/`) when it is the highest version. The installer points pi at that branch, so `pi update --extensions` always lands on the newest release. For omp it installs the newest exact tag, because Bun caches git branch heads and `omp plugin upgrade` would keep the old commit. Rerunning the installer updates both hosts. `--version` still pins one release.
+
 ## [0.13.1] - 2026-10-03
 
 ### Fixed
@@ -323,7 +329,8 @@ First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://git
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/vnlebaoduy/pi-kiro-connect/releases/tag/v0.13.0
 [0.12.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.12.0...v0.12.1

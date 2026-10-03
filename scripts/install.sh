@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Installs pi-kiro-connect into pi and/or Oh My Pi (omp).
+# Installs pi-kiro-connect into pi and/or Oh My Pi (omp) — always the newest
+# release unless --version says otherwise. Rerun it any time to update.
 #
 #   curl -fsSL https://raw.githubusercontent.com/vnlebaoduy/pi-kiro-connect/main/scripts/install.sh | bash
 #
 # Options:
-#   --version vX.Y.Z   Install that release (default: latest GitHub release)
+#   --version vX.Y.Z   Pin that release instead of following the newest
 #   --pi               Install into pi only
 #   --omp              Install into Oh My Pi only
 #   --uninstall        Remove pi-kiro-connect instead
@@ -27,10 +28,10 @@ uninstall=0
 
 usage() {
   cat <<'EOF'
-Install pi-kiro-connect into pi and/or Oh My Pi (omp).
+Install pi-kiro-connect into pi and/or Oh My Pi (omp). Rerun to update.
 
 Options:
-  --version vX.Y.Z   Install that release (default: latest GitHub release)
+  --version vX.Y.Z   Pin that release instead of following the newest
   --pi               Install into pi only
   --omp              Install into Oh My Pi only
   --uninstall        Remove pi-kiro-connect instead
@@ -69,7 +70,10 @@ fi
 [ "$want_pi" -eq 0 ] || has pi || die "--pi given but pi is not on PATH"
 [ "$want_omp" -eq 0 ] || has omp || die "--omp given but omp is not on PATH"
 
-if [ "$uninstall" -eq 0 ] && [ -z "$version" ]; then
+# Following the newest release is the default; --version pins one.
+pinned=0
+[ -z "$version" ] || pinned=1
+if [ "$uninstall" -eq 0 ] && [ "$pinned" -eq 0 ]; then
   has curl || die "curl is required to look up the latest release (or pass --version)"
   version="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
@@ -79,7 +83,10 @@ case "$version" in ""|v[0-9]*.[0-9]*.[0-9]*) ;; *) die "version must look like v
 
 # --- pi --------------------------------------------------------------------
 # pi git installs clone and run `npm install --omit=dev`, never the build, so
-# they point at release/<tag>: the tag's tree plus the CI-built dist/.
+# they point at a release branch: the tag's tree plus the CI-built dist/.
+# `release/latest` always follows the newest release, so `pi update` keeps an
+# unpinned install current on its own.
+if [ "$pinned" -eq 1 ]; then pi_ref="release/${version}"; else pi_ref="release/latest"; fi
 # `pi list` prints each source on a two-space line and its install path on a
 # four-space line beneath; only the source is accepted by `pi remove`.
 pi_installed_sources() {
@@ -92,13 +99,15 @@ if [ "$want_pi" -eq 1 ]; then
     pi remove "$source" || warn "pi: could not remove ${source}"
   done
   if [ "$uninstall" -eq 0 ]; then
-    say "pi: installing ${PACKAGE} ${version}"
-    pi install "git:github.com/${REPO}@release/${version}"
+    say "pi: installing ${PACKAGE} ${version} (${pi_ref})"
+    pi install "git:github.com/${REPO}@${pi_ref}"
   fi
 fi
 
 # --- omp -------------------------------------------------------------------
-# omp installs with bun and loads src/index.ts directly, so the plain tag works.
+# omp installs with bun and loads src/index.ts directly. It installs the exact
+# newest tag: bun caches git branch heads, so `omp plugin upgrade` on a moving
+# branch can keep serving an old commit, while a new tag is always a cache miss.
 if [ "$want_omp" -eq 1 ]; then
   for name in "$LEGACY_PACKAGE" "$PACKAGE"; do
     if omp plugin list 2>/dev/null | grep -q -E "(^|[[:space:]])${name}@"; then
@@ -117,7 +126,10 @@ if [ "$uninstall" -eq 1 ]; then
   exit 0
 fi
 
-say "Done. Start pi or omp and run /login, then pick Kiro."
+say "Done (${version}). Start pi or omp and run /login, then pick Kiro."
 if has kiro-cli; then
   echo "    Already signed in with kiro-cli? That session is picked up automatically."
+fi
+if [ "$pinned" -eq 0 ]; then
+  echo "    To update later, rerun this installer (pi users can also run: pi update --extensions)."
 fi
