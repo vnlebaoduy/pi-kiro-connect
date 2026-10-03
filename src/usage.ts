@@ -1,0 +1,186 @@
+// ABOUTME: Fetches Kiro account usage through the current Kiro management control plane.
+// ABOUTME: Maps the response into pi's generic OAuth provider usage shape for /settings.
+
+import { resolveApiRegion } from "./endpoints.js";
+import { getUsageLimits, type KiroManagementAuth, resolveKiroProfileArn } from "./management.js";
+import type { KiroCredentials } from "./oauth.js";
+
+/** Fields usage lookup reads; any OAuth credential (Pi's or OMP's projection) satisfies it. */
+export type KiroUsageCredential = Pick<KiroCredentials, "access"> &
+  Partial<Pick<KiroCredentials, "region" | "profileArn">>;
+
+const MANAGE_USAGE_URL = "https://app.kiro.dev/account/usage";
+
+type EpochLike = number | string;
+
+interface KiroFreeTrialInfo {
+  freeTrialStatus?: string;
+  freeTrialExpiry?: EpochLike;
+  currentUsage?: number;
+  currentUsageWithPrecision?: number;
+  usageLimit?: number;
+  usageLimitWithPrecision?: number;
+}
+
+interface KiroUsageBreakdown {
+  resourceType?: string;
+  displayName?: string;
+  displayNamePlural?: string;
+  currentUsage: number;
+  currentUsageWithPrecision?: number;
+  currentOverages: number;
+  currentOveragesWithPrecision?: number;
+  usageLimit: number;
+  usageLimitWithPrecision?: number;
+  unit?: string;
+  overageCharges: number;
+  currency?: string;
+  overageRate?: number;
+  nextDateReset?: EpochLike;
+  overageCap?: number;
+  overageCapWithPrecision?: number;
+  freeTrialInfo?: KiroFreeTrialInfo;
+}
+
+interface KiroUsageLimitList {
+  type?: string;
+  currentUsage?: number;
+  totalUsageLimit?: number;
+  percentUsed?: number;
+}
+
+export interface KiroGetUsageLimitsResponse {
+  limits?: KiroUsageLimitList[];
+  nextDateReset?: EpochLike;
+  daysUntilReset?: number;
+  usageBreakdown?: KiroUsageBreakdown;
+  usageBreakdownList?: KiroUsageBreakdown[];
+  subscriptionInfo?: { subscriptionTitle?: string };
+  overageConfiguration?: { overageStatus?: string };
+  userInfo?: { userId?: string; email?: string };
+}
+
+export interface KiroProviderUsageBonus {
+  label: string;
+  usedDisplay?: string;
+  limitDisplay?: string;
+  /** Raw numeric used/limit, mirroring {@link KiroProviderUsageBucket}. */
+  used?: number;
+  limit?: number;
+  expiresAt?: string;
+}
+
+export interface KiroProviderUsageBucket {
+  id: string;
+  label: string;
+  resourceType?: string;
+  usedDisplay: string;
+  limitDisplay?: string;
+  /** Raw numeric used/limit, retained so consumers can compute a percentage without parsing display strings. */
+  used?: number;
+  limit?: number;
+  unit?: string;
+  overagesDisplay?: string;
+  overageChargesDisplay?: string;
+  resetAt?: string;
+  bonus?: KiroProviderUsageBonus;
+}
+
+export interface KiroProviderUsage {
+  summary?: string;
+  subscriptionTitle?: string;
+  resetAt?: string;
+  daysUntilReset?: number;
+  overageStatus?: string;
+  manageUrl?: string;
+  usageBuckets?: KiroProviderUsageBucket[];
+  raw?: Record<string, unknown>;
+}
+
+function toIsoDate(value: EpochLike | undefined): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function formatCount(value: number | undefined): string | undefined {
+  if (value === undefined || Number.isNaN(value)) return undefined;
+  return Number.isInteger(value) ? String(value) : value.toFixed(2);
+}
+
+function formatMoney(amount: number | undefined, currency: string | undefined): string | undefined {
+  if (amount === undefined || Number.isNaN(amount) || amount <= 0) return undefined;
+  const code = currency || "USD";
+  try {
+    return new Intl.NumberFormat("en-US", { style: "currency", currency: code }).format(amount);
+  } catch {
+    return `${amount.toFixed(2)} ${code}`;
+  }
+}
+
+function mapBucket(bucket: KiroUsageBreakdown, index: number): KiroProviderUsageBucket {
+  const used = bucket.currentUsageWithPrecision ?? bucket.currentUsage;
+  const limit = bucket.usageLimitWithPrecision ?? bucket.usageLimit;
+  const overages = bucket.currentOveragesWithPrecision ?? bucket.currentOverages;
+  const freeTrialUsed = bucket.freeTrialInfo?.currentUsageWithPrecision ?? bucket.freeTrialInfo?.currentUsage;
+  const freeTrialLimit = bucket.freeTrialInfo?.usageLimitWithPrecision ?? bucket.freeTrialInfo?.usageLimit;
+
+  return {
+    id: bucket.resourceType || bucket.displayName || `usage-${index}`,
+    label: bucket.displayName || bucket.displayNamePlural || bucket.resourceType || "Usage",
+    resourceType: bucket.resourceType,
+    usedDisplay: formatCount(used) || "0",
+    limitDisplay: formatCount(limit),
+    used: typeof used === "number" && Number.isFinite(used) ? used : undefined,
+    limit: typeof limit === "number" && Number.isFinite(limit) ? limit : undefined,
+    unit: bucket.unit,
+    overagesDisplay: overages && overages > 0 ? formatCount(overages) : undefined,
+    overageChargesDisplay: formatMoney(bucket.overageCharges, bucket.currency),
+    resetAt: toIsoDate(bucket.nextDateReset),
+    bonus:
+      freeTrialUsed !== undefined || freeTrialLimit !== undefined || bucket.freeTrialInfo?.freeTrialExpiry !== undefined
+        ? {
+            label: "Bonus credits",
+            usedDisplay: formatCount(freeTrialUsed),
+            limitDisplay: formatCount(freeTrialLimit),
+            used: typeof freeTrialUsed === "number" && Number.isFinite(freeTrialUsed) ? freeTrialUsed : undefined,
+            limit: typeof freeTrialLimit === "number" && Number.isFinite(freeTrialLimit) ? freeTrialLimit : undefined,
+            expiresAt: toIsoDate(bucket.freeTrialInfo?.freeTrialExpiry),
+          }
+        : undefined,
+  };
+}
+
+async function fetchRawUsage(auth: KiroManagementAuth, profileArn?: string): Promise<KiroGetUsageLimitsResponse> {
+  const resolvedProfileArn = await resolveKiroProfileArn(auth, profileArn);
+  return getUsageLimits<KiroGetUsageLimitsResponse>(auth, {
+    profileArn: resolvedProfileArn,
+    origin: "KIRO_CLI",
+    resourceType: "CREDIT",
+    isEmailRequired: false,
+  });
+}
+
+export async function fetchKiroUsage(credentials: KiroUsageCredential): Promise<KiroProviderUsage> {
+  const auth = {
+    accessToken: credentials.access,
+    region: resolveApiRegion(credentials.region),
+  };
+  const raw = await fetchRawUsage(auth, credentials.profileArn);
+  const usageBuckets = raw.usageBreakdownList?.length
+    ? raw.usageBreakdownList.map(mapBucket)
+    : raw.usageBreakdown
+      ? [mapBucket(raw.usageBreakdown, 0)]
+      : [];
+
+  return {
+    summary: raw.subscriptionInfo?.subscriptionTitle,
+    subscriptionTitle: raw.subscriptionInfo?.subscriptionTitle,
+    resetAt: toIsoDate(raw.nextDateReset),
+    daysUntilReset: raw.daysUntilReset,
+    overageStatus: raw.overageConfiguration?.overageStatus,
+    manageUrl: MANAGE_USAGE_URL,
+    usageBuckets,
+    raw: raw as Record<string, unknown>,
+  };
+}

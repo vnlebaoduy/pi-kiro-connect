@@ -1,0 +1,1905 @@
+// ABOUTME: Core streaming integration for Kiro API requests and responses.
+// ABOUTME: Handles request building, retry logic, event parsing, and token counting.
+
+import { createHash } from "node:crypto";
+import { appendFile, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type {
+  Api,
+  AssistantMessage,
+  AssistantMessageEventStream,
+  Context,
+  ImageContent,
+  Model,
+  Message as PiMessage,
+  SimpleStreamOptions,
+  TextContent,
+  ThinkingContent,
+  Tool,
+  ToolCall,
+  ToolResultMessage,
+} from "@earendil-works/pi-ai";
+import * as PiAi from "@earendil-works/pi-ai";
+import { UniversalEventStreamMarshaller } from "@smithy/core/event-streams";
+import type { Message } from "@smithy/types";
+import { parseBracketToolCalls } from "./bracket-tool-parser.js";
+import { applyCacheEstimate } from "./cache-estimator.js";
+import { debugEnabled, debugLog, formatSafeError, redactSensitiveText } from "./debug.js";
+import {
+  buildKiroAdditionalModelRequestFields,
+  getKiroEffortConfig,
+  type KiroAdditionalModelRequestFields,
+} from "./effort.js";
+import { getKiroEndpoints, getKiroRegionFromEndpoint, getKiroRegionFromProfileArn } from "./endpoints.js";
+import { extractKiroReasonCode, KiroApiError, parseRetryAfterMs } from "./errors.js";
+import { type KiroErrorData, type KiroUsageData, parseKiroEvent, parseKiroExceptionFrame } from "./event-parser.js";
+import {
+  addPlaceholderTools,
+  assertHistoryWithinLimit,
+  HISTORY_LIMIT,
+  HISTORY_LIMIT_CONTEXT_WINDOW,
+  prepareHistory,
+} from "./history.js";
+import { isKiroToolStructureRule, kiroConversationEntries, repairKiroConversation } from "./history-validator.js";
+import { parseInvokeToolCalls } from "./invoke-tool-parser.js";
+import { getKiroCliCredentials, getKiroCliCredentialsAllowExpired, refreshViaKiroCli } from "./kiro-cli.js";
+import {
+  invalidateKiroProfileArn,
+  type KiroManagementAuth,
+  KiroManagementHttpError,
+  resetKiroProfileArnCache,
+  resolveKiroProfileArn,
+} from "./management.js";
+import { resolveKiroModel } from "./models.js";
+import { kiroAuthHeaders } from "./oauth.js";
+import {
+  capacityRetryConfig,
+  exponentialBackoff,
+  extractKiroReason,
+  firstTokenTimeoutForModel,
+  isCapacityError,
+  isNonRetryableBodyError,
+  isTooBigError,
+  KIRO_REASON_CODES,
+  MAX_RETRY_DELAY,
+  resolveRequestRateRetryDelay,
+  retryConfig,
+} from "./retry.js";
+import { ThinkingTagParser } from "./thinking-parser.js";
+import { kiroTokenTypeHeaders } from "./token-type.js";
+import { countTokens } from "./tokenizer.js";
+import { normalizeToolName } from "./tool-name-aliases.js";
+import { parseToolUseCalls } from "./tool-use-parser.js";
+import {
+  buildHistory,
+  convertImagesToKiro,
+  convertToolsToKiro,
+  EMPTY_CONTENT_PLACEHOLDER,
+  extractImages,
+  getContentText,
+  type KiroHistoryEntry,
+  type KiroImage,
+  type KiroToolResult,
+  type KiroToolSpec,
+  type KiroUserInputMessage,
+  normalizeMessages,
+  relocateDisplacedToolResults,
+  sanitizeSurrogates,
+  TOOL_RESULT_LIMIT,
+  toKiroToolUseId,
+  truncate,
+} from "./transform.js";
+import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js";
+import { estimateKiroCreditCost, type KiroUsageTracking } from "./usage-tracking.js";
+
+/** Minimal structural view of a refreshed Kiro credential handed to the host's
+ *  accessor. A superset lives in `oauth.ts` (`KiroCredentials`); this pins only
+ *  what write-back reads so the accessor contract does not couple to that type. */
+export interface KiroCredentialLike {
+  access: string;
+  expires?: number;
+  region?: string;
+  profileArn?: string;
+  authMethod?: string;
+}
+
+/** Optional host-owned credential accessor, passed on stream options. `get`
+ *  seeds each call from the freshest token the host holds; `set` receives a
+ *  credential the provider refreshed mid-call so it survives the call (and, via
+ *  the host's persistence, later calls/processes). `ensureFresh` is awaited
+ *  before the token is read, so a host that knows the expiry can refresh ahead
+ *  of it instead of waiting for a 403. All are optional and best-effort — the
+ *  provider falls back to the static `apiKey` and never lets an accessor
+ *  failure fail the turn. */
+export interface KiroCredentialAccessor {
+  get?: () => string | undefined;
+  set?: (creds: KiroCredentialLike) => void;
+  ensureFresh?: () => Promise<void>;
+}
+
+/** streamKiro options: the shared `SimpleStreamOptions` plus Kiro's optional
+ *  host credential accessor, so typed consumers can pass it without a cast. */
+export interface KiroStreamOptions extends SimpleStreamOptions {
+  credentialAccessor?: KiroCredentialAccessor;
+}
+
+const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
+const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
+
+const eventStreamMarshaller = new UniversalEventStreamMarshaller({
+  utf8Encoder: (input: Uint8Array) => new TextDecoder().decode(input),
+  utf8Decoder: (input: string) => new TextEncoder().encode(input),
+});
+
+let capacityLogDirCreated = false;
+
+function logCapacityEvent(message: string): void {
+  // Fire-and-forget async logging to avoid blocking the event loop
+  (async () => {
+    try {
+      if (!capacityLogDirCreated) {
+        await mkdir(CAPACITY_LOG_DIR, { recursive: true });
+        capacityLogDirCreated = true;
+      }
+      await appendFile(CAPACITY_LOG_FILE, `${new Date().toISOString()} ${message}\n`);
+    } catch {
+      // best-effort logging, don't break the provider
+    }
+  })();
+}
+
+/** Delay that rejects early if the abort signal fires. */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function createResponseHeaderDeadline(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number,
+): {
+  signal: AbortSignal;
+  didTimeout: () => boolean;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout>;
+  const onCallerAbort = () => {
+    clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", onCallerAbort);
+    controller.abort(callerSignal?.reason);
+  };
+  timer = setTimeout(() => {
+    timedOut = true;
+    callerSignal?.removeEventListener("abort", onCallerAbort);
+    controller.abort(new DOMException("Kiro response headers timeout", "TimeoutError"));
+  }, timeoutMs);
+
+  if (callerSignal?.aborted) {
+    onCallerAbort();
+  } else {
+    callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    cleanup: () => {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    },
+  };
+}
+
+interface KiroRequest {
+  conversationState: {
+    chatTriggerType: "MANUAL";
+    agentTaskType: "vibe";
+    conversationId: string;
+    currentMessage: { userInputMessage: KiroUserInputMessage };
+    history?: KiroHistoryEntry[];
+  };
+  additionalModelRequestFields?: KiroAdditionalModelRequestFields;
+  profileArn: string;
+  agentMode?: string;
+}
+interface KiroToolCallState {
+  toolUseId: string;
+  name: string;
+  input: string;
+}
+
+let skipProfileResolutionForTests = false;
+const TEST_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:000000000000:profile/test";
+
+/** Reset profile resolution state — exported for stream tests. */
+export function resetProfileArnCache(resolved = false): void {
+  resetKiroProfileArnCache();
+  skipProfileResolutionForTests = resolved;
+}
+
+/**
+ * Pluralise an observed-attempt count for a diagnostic. The count is what was
+ * actually seen, not the configured retry budget: the two diverge whenever a
+ * 403 refresh, a timeout or a mid-stream error already spent part of the shared
+ * budget, and a diagnostic that exists to explain a silent failure must not
+ * itself assert something that did not happen.
+ *
+ * Deliberately not worded as "consecutive": the degenerate attempts need not be
+ * adjacent. A 403 credential refresh or a mid-stream error can land between two
+ * of them and spend the same shared budget, so an unqualified count is the only
+ * claim the counter can actually support.
+ */
+function describeAttempts(count: number): string {
+  return count === 1 ? "1 attempt" : `${count} attempts`;
+}
+
+/**
+ * Cap for wire-derived echo text quoted into a persisted `errorMessage`. The
+ * echo pattern `/^\s*(continue|\.+)\s*$/i` admits an arbitrarily long run of
+ * dots, and this string is written into the assistant record. Matches the
+ * 200-char cap already used for raw tool input in `emitToolCall`'s parse warning
+ * below. Tool-name collections use their own whole-value policy in
+ * `describeDroppedToolNames`; they are never sliced into partial identities.
+ */
+const DIAGNOSTIC_QUOTE_LIMIT = 200;
+
+/**
+ * INVARIANT: no unbounded integer may be interpolated into a persisted
+ * `errorMessage`. Consumers classify that string by pattern-matching its text,
+ * and the predicate in the wild (Kermes `isRetryableStreamError`) matches bare
+ * `429|500|502|503|504` with NO word boundary. So a `(5000 chars total)`
+ * annotation makes a diagnostic that says "terminal, do not retry" read as a
+ * transient HTTP 500 and get suppressed — precisely the silent failure these
+ * diagnostics exist to defeat, reintroduced by the diagnostic itself.
+ *
+ * Hence the truncation marker carries no length: the exact length goes to
+ * `console.warn`, which no classifier reads. The only integer these diagnostics
+ * interpolate is the observed-attempt count, bounded by `maxRetries + 1` = 4.
+ *
+ * Wire-derived tool names can carry the same trigger text, so they are encoded
+ * before entering this diagnostic. See `encodeToolNameForDiagnostic`.
+ */
+function clampForDiagnostic(text: string): string {
+  return text.length <= DIAGNOSTIC_QUOTE_LIMIT ? text : `${text.slice(0, DIAGNOSTIC_QUOTE_LIMIT)}… (truncated)`;
+}
+
+/**
+ * Encode untrusted bytes without letting their text change how a consumer
+ * classifies the surrounding error. Each byte is represented by two letters,
+ * A through P, for its high and low nibbles. That alphabet contains no digits
+ * and cannot spell any alternative in Kermes' retryable-error predicate.
+ */
+function encodeBytesForDiagnostic(bytes: Uint8Array): string {
+  let encoded = "";
+  for (const byte of bytes) {
+    encoded += String.fromCharCode(65 + (byte >> 4), 65 + (byte & 0x0f));
+  }
+  return encoded;
+}
+
+/**
+ * Encode one tool-name identity reversibly from its UTF-16 code units. String
+ * names retain their exact value. A malformed non-string wire name is prefixed
+ * with its runtime type and JSON representation, so it stays distinguishable
+ * from a legitimate string with the same rendered text.
+ *
+ * Using `TextEncoder` here would replace an unpaired surrogate with U+FFFD,
+ * corrupting the only persisted identity of a dropped call; JSON permits that
+ * escaped shape and the event parser carries it through as a JavaScript string.
+ * Quoting any identity verbatim is unsafe: values such as `set_timeout` and
+ * `http500_probe` make a terminal diagnostic look transient to consumers.
+ */
+function encodeToolNameForDiagnostic(name: unknown): string {
+  const identity = typeof name === "string" ? name : `${typeof name}:${JSON.stringify(name)}`;
+  let encoded = "";
+  for (let i = 0; i < identity.length; i++) {
+    const codeUnit = identity.charCodeAt(i);
+    encoded += String.fromCharCode(
+      65 + (codeUnit >> 12),
+      65 + ((codeUnit >> 8) & 0x0f),
+      65 + ((codeUnit >> 4) & 0x0f),
+      65 + (codeUnit & 0x0f),
+    );
+  }
+  return encoded;
+}
+
+/**
+ * Describe the complete dropped-name set without unbounded output or partial
+ * identities. A set that fits is reversible name by name. If the complete set
+ * would exceed the diagnostic limit, replace all names with one SHA-256
+ * fingerprint. The explicit marker means no valid-looking name prefix can be
+ * mistaken for the whole identity, while the fingerprint still lets two
+ * records be compared exactly.
+ */
+function describeDroppedToolNames(names: unknown[]): string {
+  const encoded = names.map((name) => `A-P:${encodeToolNameForDiagnostic(name)}`).join(", ");
+  if (encoded.length <= DIAGNOSTIC_QUOTE_LIMIT) return encoded;
+  const digest = createHash("sha256").update(JSON.stringify(names)).digest();
+  return `A-P-DIGEST:${encodeBytesForDiagnostic(digest)} (tool identities fingerprinted)`;
+}
+
+/**
+ * Content kinds that cannot belong to the attempt writing the exhausted-empty-
+ * response diagnostic, so any surviving block of that kind was left by an
+ * attempt that was discarded. See `describeReturnedContent` for why each kind is
+ * or is not in this set.
+ */
+const DISCARDED_ONLY_KINDS: ReadonlySet<AssistantMessage["content"][number]["type"]> = new Set(["text", "toolCall"]);
+
+/**
+ * What the MESSAGE carries, for the exhausted-empty-response diagnostic. "No
+ * text and no tool calls" does NOT imply empty content: a reasoning turn that
+ * emits only `thinkingText` and then ends is degenerate by that test while
+ * `output.content` still holds its thinking block, and a `ThinkingTagParser`
+ * turn can leave a zero-length text block behind. Claiming `empty content`
+ * there would assert something not observed.
+ *
+ * `residue` distinguishes blocks this attempt produced from blocks a DISCARDED
+ * attempt left behind, and the distinction is per KIND rather than per message,
+ * because on this branch the two are mixed. `output.content` is reset on the
+ * degenerate retry but not on the mid-stream-error retry, so blocks can outlive
+ * the attempt that made them:
+ *
+ *  - `text` cannot be this attempt's. `textBlockIndex` is per-attempt and every
+ *    path that opens a text block also puts non-empty text in it, which would
+ *    make `hasText` true and the turn non-degenerate.
+ *  - `toolCall` cannot be this attempt's either. Every emit site sets
+ *    `sawAnyToolCalls` first -- the native `toolUse` handler, the end-of-stream
+ *    flush, and the text-dialect fallback, which sets it before emitting any
+ *    recovered call -- and `degenerate` requires `!sawAnyToolCalls`.
+ *  - `thinking` CAN be this attempt's: a reasoning turn that emits only
+ *    `thinkingText` is degenerate by that exact test while its own thinking
+ *    block sits in `output.content`.
+ *
+ * So a whole-message boolean is wrong in both directions: it would blame this
+ * attempt's thinking on a discarded one, or claim "returning only text content"
+ * in the same sentence as "no text" -- and equally "returning only toolCall
+ * content" beside "no tool calls". Both halves are named separately when both
+ * are present.
+ *
+ * Block TYPES only, never a count: a count is an unbounded integer, which the
+ * invariant above forbids. The type vocabulary is pi's own fixed set of content
+ * discriminants, so it carries no digits and no wire-controlled text.
+ */
+function describeReturnedContent(content: AssistantMessage["content"]): string {
+  const kinds = [...new Set(content.map((block) => block.type))].sort();
+  if (kinds.length === 0) return "returning empty content";
+  const own = kinds.filter((kind) => !DISCARDED_ONLY_KINDS.has(kind));
+  const discarded = kinds.filter((kind) => DISCARDED_ONLY_KINDS.has(kind));
+  const clauses: string[] = [];
+  if (own.length > 0) clauses.push(`returning only ${own.join(" and ")} content`);
+  if (discarded.length > 0) {
+    const lead = own.length > 0 ? "plus" : "returning only";
+    clauses.push(`${lead} ${discarded.join(" and ")} content left by earlier discarded attempts`);
+  }
+  return clauses.join(" ");
+}
+
+function emitToolCall(
+  state: KiroToolCallState,
+  output: AssistantMessage,
+  stream: AssistantMessageEventStream,
+): boolean {
+  if (!state.input.trim()) {
+    // Kiro API omits the input payload when the model calls a tool with no
+    // arguments (e.g. mcp({})). Treat empty input as an empty object rather
+    // than skipping — these are valid zero-arg tool calls, not truncations.
+    state.input = "{}";
+  }
+
+  let args: Record<string, unknown>;
+  try {
+    args = JSON.parse(state.input) as Record<string, unknown>;
+  } catch (e) {
+    // Returning false drops the call: nothing is pushed into `output.content`,
+    // so the call the model made never reaches the agent. Callers record the
+    // name in `droppedToolCalls` so the turn can carry an `errorMessage` about
+    // it — a console warning is invisible to whoever reads the transcript.
+    console.warn(
+      `[pi-kiro-connect] Failed to parse tool input for "${state.name}" (toolUseId: ${state.toolUseId}): ${formatSafeError(e)}. Raw input (${state.input.length} chars): ${redactSensitiveText(state.input.substring(0, 200))}`,
+    );
+    return false;
+  }
+
+  const contentIndex = output.content.length;
+  const toolCall: ToolCall = {
+    type: "toolCall",
+    id: state.toolUseId,
+    name: normalizeToolName(state.name),
+    arguments: args,
+  };
+  output.content.push(toolCall);
+  stream.push({ type: "toolcall_start", contentIndex, partial: output });
+  stream.push({ type: "toolcall_delta", contentIndex, delta: state.input, partial: output });
+  stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+  return true;
+}
+
+interface TranscriptSystemMessage {
+  role: "system";
+  content: string | TextContent[];
+  sections?: Record<string, string | null>;
+  toolsAdded?: Tool[];
+  toolsRemoved?: Array<{ name: string }>;
+}
+
+type ProviderContext = Context | { messages: Array<PiMessage | TranscriptSystemMessage> };
+
+function transcriptContentText(content: string | TextContent[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+/**
+ * Resolve both legacy Context fields and pi 0.86+ transcript-backed prompt/tool state.
+ * Kiro carries the system prompt outside history, so system messages are collapsed
+ * and removed from the conversation passed to its user/assistant transformer.
+ */
+function resolveProviderContext(context: ProviderContext): {
+  messages: PiMessage[];
+  systemPrompt: string;
+  tools: Tool[];
+} {
+  const legacy = context as Context;
+  const promptParts = legacy.systemPrompt ? [legacy.systemPrompt] : [];
+  const sections = new Map<string, string>();
+  const tools = new Map((legacy.tools ?? []).map((tool) => [tool.name, tool]));
+  const messages: PiMessage[] = [];
+
+  for (const message of context.messages) {
+    if (message.role !== "system") {
+      messages.push(message as PiMessage);
+      continue;
+    }
+
+    const text = transcriptContentText(message.content);
+    if (text) promptParts.push(text);
+    for (const [name, value] of Object.entries(message.sections ?? {})) {
+      if (value === null) sections.delete(name);
+      else sections.set(name, value);
+    }
+    for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+    for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+  }
+
+  return {
+    messages,
+    systemPrompt: [...promptParts, ...sections.values()].join("\n\n"),
+    tools: [...tools.values()],
+  };
+}
+
+export function streamKiro(
+  model: Model<Api>,
+  context: ProviderContext,
+  options?: KiroStreamOptions,
+): AssistantMessageEventStream {
+  return streamKiroWithUsageTracking(
+    {
+      estimateDollarValue: false,
+      usdPerCredit: 0,
+      estimateCacheUsage: false,
+      estimatedCacheTimeout: 300_000,
+    },
+    model,
+    context,
+    options,
+  );
+}
+
+export function createKiroStream(
+  usageTracking: KiroUsageTracking,
+): (model: Model<Api>, context: ProviderContext, options?: KiroStreamOptions) => AssistantMessageEventStream {
+  return (model, context, options) => streamKiroWithUsageTracking(usageTracking, model, context, options);
+}
+
+function streamKiroWithUsageTracking(
+  usageTracking: KiroUsageTracking,
+  model: Model<Api>,
+  context: ProviderContext,
+  options?: KiroStreamOptions,
+): AssistantMessageEventStream {
+  const {
+    messages: contextMessages,
+    tools: currentTools,
+    systemPrompt: currentSystemPrompt,
+  } = resolveProviderContext(context);
+
+  // pi-ai's barrel re-exports the class as type-only before the runtime class re-export, so
+  // a named import of AssistantMessageEventStream resolves to a type. Read it from the
+  // namespace import to get the actual constructor. Replaces the removed
+  // createAssistantMessageEventStream() factory (gone in @oh-my-pi/pi-ai).
+  const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
+    .AssistantMessageEventStream;
+  const stream = new StreamCtor();
+  (async () => {
+    const output: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+    // Refresh decisions/outcomes for THIS call. Declared outside the try so the
+    // terminal catch can surface it: it makes "the 3 retries failed" decidable
+    // (refresh returned nothing vs. the refreshed token was itself rejected)
+    // instead of invisible on the child's stderr.
+    const refreshTrace: string[] = [];
+    try {
+      // Credential accessor (optional): a mutable getter/setter the host owns so a
+      // token refreshed mid-call survives the call. Seeded from the accessor when
+      // present, else the static apiKey. Written back after any successful refresh
+      // so the NEXT call — and, via the host's persistence, sibling processes and
+      // later sessions — start from the fresh token instead of paying another 403.
+      // Structural, not nominal: the host passes a plain object, we never import
+      // its type. `set` is best-effort and must never throw into the turn.
+      const credentialAccessor = options?.credentialAccessor;
+      // Proactive refresh: let the host rotate a token it knows is about to
+      // expire before we read it. The reactive 403 retry below stays as the
+      // safety net, so a failed ensureFresh is swallowed, not fatal.
+      try {
+        await credentialAccessor?.ensureFresh?.();
+      } catch {
+        // best-effort — fall through to whatever token the host holds.
+      }
+      const seededToken = credentialAccessor?.get?.() || options?.apiKey;
+      if (!seededToken) throw new Error("Kiro credentials not set. Run /login kiro or install kiro-cli.");
+      let accessToken: string = seededToken;
+      // Persist a refreshed credential back to the host, once, only when the token
+      // actually changed. Never throws: a classification/persist failure must not
+      // fail a turn the refresh just rescued.
+      const writeBackCredential = (creds: KiroCredentialLike, previousToken: string): void => {
+        try {
+          if (!creds?.access || creds.access === previousToken) return;
+          credentialAccessor?.set?.(creds);
+        } catch {
+          // best-effort — the host's persistence is not load-bearing for this turn.
+        }
+      };
+      const modelMetadata = model as Model<Api> & {
+        kiroModelId?: string;
+        kiroRegion?: string;
+        kiroProfileArn?: string;
+        additionalModelRequestFieldsSchema?: Record<string, unknown>;
+        recoverTextToolCalls?: boolean;
+      };
+      const region = modelMetadata.kiroRegion ?? getKiroRegionFromEndpoint(model.baseUrl) ?? "us-east-1";
+      let managementAuth: KiroManagementAuth = { accessToken, region };
+
+      const optionProfileArn =
+        (options as unknown as { credentials?: { profileArn?: string }; profileArn?: string })?.credentials
+          ?.profileArn || (options as unknown as { profileArn?: string })?.profileArn;
+      const cliCreds = getKiroCliCredentials() ?? getKiroCliCredentialsAllowExpired();
+      const cliProfileArn = cliCreds?.access === accessToken ? cliCreds.profileArn : undefined;
+      const initialProfileArn = modelMetadata.kiroProfileArn || optionProfileArn || cliProfileArn;
+      let profileArn: string;
+      try {
+        profileArn =
+          initialProfileArn ||
+          (skipProfileResolutionForTests ? TEST_PROFILE_ARN : await resolveKiroProfileArn(managementAuth));
+      } catch (error) {
+        if (!(error instanceof KiroManagementHttpError) || error.status !== 403) throw error;
+
+        // The host may have captured an access token before kiro-cli rotated it.
+        // Re-read the shared store first, then force a refresh only when it still
+        // contains the rejected token. Profile discovery must succeed before the
+        // runtime request can be constructed.
+        const rejectedToken = accessToken;
+        const storedCreds = getKiroCliCredentials();
+        const forcedRefresh = !(storedCreds?.access && storedCreds.access !== accessToken);
+        const freshCreds = forcedRefresh ? refreshViaKiroCli() : storedCreds;
+        if (!freshCreds?.access) {
+          refreshTrace.push(
+            forcedRefresh ? "profile-403: refresh returned no token" : "profile-403: store had no fresh token",
+          );
+          throw error;
+        }
+        refreshTrace.push(
+          freshCreds.access === rejectedToken
+            ? "profile-403: refreshed token identical (entitlement?)"
+            : forcedRefresh
+              ? "profile-403: refreshed via kiro-cli"
+              : "profile-403: adopted token from store",
+        );
+
+        accessToken = freshCreds.access;
+        // Hand the refreshed credential back to the host so it survives the call.
+        writeBackCredential(freshCreds, rejectedToken);
+        managementAuth = { accessToken, region };
+        profileArn =
+          freshCreds.profileArn ||
+          (skipProfileResolutionForTests ? TEST_PROFILE_ARN : await resolveKiroProfileArn(managementAuth));
+      }
+
+      // ListAvailableProfiles probes across regions (#104, #131), so an SSO login
+      // in one region can legitimately resolve a profile owned by another. The
+      // runtime host and the catalog have to follow the profile: sending a
+      // cross-region profile ARN to the runtime API fails the whole request with
+      // a generic `Improperly formed request.`.
+      let runtimeRegion = getKiroRegionFromProfileArn(profileArn) ?? region;
+      let endpoint = new URL("generateAssistantResponse", getKiroEndpoints(runtimeRegion).runtime).toString();
+
+      // Trigger dynamic models cache update in the background if empty or stale
+      const { isCacheStale, updateKiroModelsCache } = await import("./models.js");
+      if (!process.env.VITEST && isCacheStale(runtimeRegion)) {
+        updateKiroModelsCache(accessToken, runtimeRegion, profileArn).catch((error) => {
+          console.warn(
+            `[pi-kiro-connect] Failed to refresh Kiro model catalog in ${runtimeRegion}: ${formatSafeError(error)}`,
+          );
+        });
+      }
+
+      const kiroModelId = resolveKiroModel(model.id, modelMetadata.kiroModelId);
+      const effortConfig = getKiroEffortConfig(modelMetadata.additionalModelRequestFieldsSchema, kiroModelId);
+      const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(
+        modelMetadata,
+        kiroModelId,
+        options?.reasoning,
+      );
+      const thinkingEnabled = !!options?.reasoning || model.reasoning;
+      debugLog("request.init", {
+        endpoint,
+        model: model.id,
+        kiroModelId,
+        contextWindow: model.contextWindow,
+        thinkingEnabled,
+        reasoning: options?.reasoning,
+        messageCount: contextMessages.length,
+        toolCount: currentTools.length,
+        hasSystemPrompt: !!currentSystemPrompt,
+        profileArn,
+        sessionId: options?.sessionId,
+      });
+      let systemPrompt = currentSystemPrompt;
+      // Kiro's runtime endpoint honors structured effort but only exposes Claude's
+      // user-visible thinking stream when the legacy thinking markers are also
+      // present. Keep both controls: structured fields select effort, while these
+      // markers preserve the <thinking> content consumed by ThinkingTagParser.
+      if (thinkingEnabled && effortConfig?.field !== "reasoning") {
+        const budget =
+          options?.reasoning === "xhigh"
+            ? 50000
+            : options?.reasoning === "high"
+              ? 30000
+              : options?.reasoning === "medium"
+                ? 20000
+                : 10000;
+        systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${systemPrompt ? `\n${systemPrompt}` : ""}`;
+      }
+      let retryCount = 0;
+      const maxRetries = 3;
+      /** Degenerate attempts, counted BY SHAPE. Both are counted separately from
+       *  `retryCount`, which is the shared retry budget also spent by 403 credential
+       *  refreshes, idle/first-token timeouts and mid-stream errors — so
+       *  `maxRetries + 1` is NOT the number of empty attempts, and reporting it as
+       *  such overstates what was observed.
+       *
+       *  Split rather than pooled because the two shapes are not interchangeable and
+       *  the exhaustion diagnostic is worded from the LAST attempt's shape only. The
+       *  model can echo on one attempt and return nothing on the next; a single
+       *  pooled counter would then make "returned no text ... on 4 attempts" out of
+       *  three empty attempts and one that did carry text, or claim four echoes from
+       *  one. Each diagnostic reports its own shape's count and, when the other shape
+       *  also occurred, names it separately. */
+      let emptyAttempts = 0;
+      let echoAttempts = 0;
+
+      // Cumulative provider-internal retry tallies reported on KiroApiError.
+      // `retryCount` cannot stand in for either: it is also consumed by stream
+      // errors, idle/first-token timeouts, and empty-response retries, and
+      // `capacityRetryCount` resets on every outer iteration.
+      let credentialRefreshTotal = 0;
+      let capacityRetryTotal = 0;
+      const conversationId = options?.sessionId ?? crypto.randomUUID();
+      // Every wire-derived usage figure is written straight onto `output`, which
+      // outlives the retry loop, so an abandoned attempt's accounting would
+      // otherwise be billed to the turn that replaced it. Two live paths:
+      // `contextUsageEvent` sets `usage.input`/`contextPercent` mid-stream, and
+      // the post-stream metadataEvent writes land *before* the empty-response /
+      // echo-loop retry check. Clearing at the attempt boundary keeps the whole
+      // usage block sourced from one attempt, matching how `usageEvent` itself
+      // is scoped per attempt.
+      const resetAttemptUsage = () => {
+        output.usage.input = 0;
+        output.usage.output = 0;
+        output.usage.cacheRead = 0;
+        output.usage.cacheWrite = 0;
+        output.usage.totalTokens = 0;
+        output.usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+        // Not part of pi's Usage shape; only present once a contextUsageEvent
+        // has been seen, so a retried turn must not report the old gauge.
+        delete (output.usage as unknown as Record<string, unknown>).contextPercent;
+      };
+      requestLoop: while (retryCount <= maxRetries) {
+        if (options?.signal?.aborted) throw options.signal.reason;
+        resetAttemptUsage();
+        const effectiveSystemPrompt = systemPrompt;
+        // Relocate a tool result that arrived behind a later assistant turn than
+        // the one that called it, before anything positional runs. Interleaved
+        // concurrent tool executions produce that shape, and `sanitizeHistory`
+        // pairs POSITIONALLY, so without this pass the displaced result's issuing
+        // assistant is dropped and the real tool output is discarded. Pure
+        // reorder — see `relocateDisplacedToolResults`.
+        const normalized = relocateDisplacedToolResults(normalizeMessages(contextMessages));
+        const {
+          history: rawHistory,
+          systemPrepended,
+          currentMsgStartIdx,
+        } = buildHistory(normalized, kiroModelId, effectiveSystemPrompt);
+        // Preserve semantic context locally; Pi owns lossy compaction.
+        const history = prepareHistory(rawHistory, model.input.includes("image"));
+        const dynamicHistoryLimit = Math.floor((model.contextWindow / HISTORY_LIMIT_CONTEXT_WINDOW) * HISTORY_LIMIT);
+        const toolResultLimit = TOOL_RESULT_LIMIT;
+        const currentMessages = normalized.slice(currentMsgStartIdx);
+        const firstMsg = currentMessages[0];
+        let currentContent = "";
+        const currentToolResults: KiroToolResult[] = [];
+        let currentImages: KiroImage[] | undefined;
+        if (firstMsg?.role === "assistant") {
+          const am = firstMsg as AssistantMessage;
+          let armContent = "";
+          const armToolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
+          if (Array.isArray(am.content))
+            for (const b of am.content) {
+              if (b.type === "text") armContent += (b as TextContent).text;
+              // Reasoning is deliberately NOT serialized into the assistant text
+              // channel, matching `buildHistory` and first-party
+              // `extractTextContent`, which type-filters to `text`. Flattening it
+              // to `<thinking>...</thinking>` writes literal markup into the
+              // string the model reads back as its own prior speech.
+              //
+              // Unlike the history site, this needs no "turn had blocks" guard:
+              // `currentMsgStartIdx` increments past an assistant that declares no
+              // `toolCall`, so reaching this branch at all means one exists and
+              // `armToolUses` is non-empty. The guard below therefore cannot drop
+              // the entry when reasoning is excluded.
+              else if (b.type === "toolCall") {
+                const tc = b as ToolCall;
+                armToolUses.push({
+                  name: tc.name,
+                  toolUseId: toKiroToolUseId(tc.id),
+                  input:
+                    typeof tc.arguments === "string"
+                      ? JSON.parse(tc.arguments)
+                      : (tc.arguments as Record<string, unknown>),
+                });
+              }
+            }
+          if (armContent || armToolUses.length > 0) {
+            const lastEntryForArm = history[history.length - 1];
+            const prevArm = lastEntryForArm?.assistantResponseMessage;
+            if (history.length > 0 && !lastEntryForArm?.userInputMessage && prevArm) {
+              // Merge into previous assistant message to maintain alternation
+              // without synthetic padding. Join only non-empty sides: a turn that
+              // carried only reasoning or only a tool call leaves `armContent`
+              // empty, and an unconditional separator would append a bare `\n\n`
+              // onto text the model actually produced.
+              prevArm.content =
+                prevArm.content && armContent ? `${prevArm.content}\n\n${armContent}` : prevArm.content || armContent;
+              if (armToolUses.length > 0) prevArm.toolUses = [...(prevArm.toolUses || []), ...armToolUses];
+            } else {
+              history.push({
+                assistantResponseMessage: {
+                  content: armContent,
+                  ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}),
+                },
+              });
+            }
+          }
+          const toolResultImages: ImageContent[] = [];
+          for (let i = 1; i < currentMessages.length; i++) {
+            const m = currentMessages[i];
+            if (m.role === "toolResult") {
+              const trm = m as ToolResultMessage;
+              currentToolResults.push({
+                content: [{ text: truncate(getContentText(m), toolResultLimit) }],
+                status: trm.isError ? "error" : "success",
+                toolUseId: toKiroToolUseId(trm.toolCallId),
+              });
+              if (Array.isArray(trm.content))
+                for (const c of trm.content) if (c.type === "image") toolResultImages.push(c as ImageContent);
+            }
+          }
+          if (toolResultImages.length > 0) {
+            const converted = convertImagesToKiro(toolResultImages);
+            currentImages = currentImages ? [...currentImages, ...converted] : converted;
+          }
+          // A tool turn carries its payload in `userInputMessageContext.toolResults`,
+          // so it needs no text. Leaving this empty also leaves the fallback
+          // below free to fill in only genuinely payload-less turns.
+          currentContent = "";
+        } else if (firstMsg?.role === "toolResult") {
+          const toolResultImages2: ImageContent[] = [];
+          for (const m of currentMessages)
+            if (m.role === "toolResult") {
+              const trm = m as ToolResultMessage;
+              currentToolResults.push({
+                content: [{ text: truncate(getContentText(m), toolResultLimit) }],
+                status: trm.isError ? "error" : "success",
+                toolUseId: toKiroToolUseId(trm.toolCallId),
+              });
+              if (Array.isArray(trm.content))
+                for (const c of trm.content) if (c.type === "image") toolResultImages2.push(c as ImageContent);
+            }
+          if (toolResultImages2.length > 0) {
+            const converted = convertImagesToKiro(toolResultImages2);
+            currentImages = currentImages ? [...currentImages, ...converted] : converted;
+          }
+          // Empty by design — `toolResults` is this turn's payload.
+          currentContent = "";
+        } else if (firstMsg?.role === "user") {
+          currentContent = typeof firstMsg.content === "string" ? firstMsg.content : getContentText(firstMsg);
+          if (effectiveSystemPrompt && !systemPrepended)
+            currentContent = `${effectiveSystemPrompt}\n\n${currentContent}`;
+        }
+        // Current assistant tool calls are outbound history too, so enforce the
+        // budget only after they have been appended.
+        assertHistoryWithinLimit(history, dynamicHistoryLimit);
+        // Prepend truncation notice if the previous assistant response was cut off
+        if (wasPreviousResponseTruncated(contextMessages)) {
+          currentContent = currentContent === "" ? TRUNCATION_NOTICE : `${TRUNCATION_NOTICE}\n\n${currentContent}`;
+        }
+        // Always synthesize placeholder specs for tool names referenced in
+        // history, even when the current tools are empty/undefined. Without this,
+        // an "advisor-style" call that inherits a tool-rich conversation but
+        // declares no current tools is rejected by Kiro as "Improperly formed
+        // request" because history references toolUses with no tool catalog.
+        let uimc: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } | undefined;
+        const baseTools = currentTools.length ? convertToolsToKiro(currentTools) : [];
+        const finalTools = history.length > 0 ? addPlaceholderTools(baseTools, history) : baseTools;
+        if (currentToolResults.length > 0 || finalTools.length > 0) {
+          uimc = {};
+          if (currentToolResults.length > 0) uimc.toolResults = currentToolResults;
+          if (finalTools.length > 0) uimc.tools = finalTools;
+        }
+        if (firstMsg?.role === "user") {
+          const imgs = extractImages(firstMsg);
+          if (imgs.length > 0) currentImages = convertImagesToKiro(imgs as ImageContent[]);
+        }
+        // A turn with neither text nor tool results has no payload at all:
+        // an image-only user message, an empty-text user message, or a
+        // host-appended message whose role falls outside pi-ai's `Message`
+        // union. Send a neutral prompt so its attachments still reach the
+        // model (#106).
+        //
+        // The `currentToolResults` guard is load-bearing. Without it this line
+        // refills every tool turn that deliberately left `currentContent`
+        // empty, and the only change is which sentence is fabricated. Kiro's
+        // rule is content **or** tool results — see EMPTY_CONTENT_PLACEHOLDER.
+        if (currentContent === "" && currentToolResults.length === 0) currentContent = EMPTY_CONTENT_PLACEHOLDER;
+        // kiro-cli does not enforce alternation — the API accepts
+        // non-alternating history. No synthetic padding needed.
+        //
+        // Pre-send REPAIR against the seven rules first-party Kiro Agent
+        // enforces. `prepareHistory` covers the shapes this provider itself
+        // produces, but not every shape a caller can hand us: `sanitizeHistory`
+        // tests tool pairing by POSITION, so an assistant entry with `toolUses`
+        // survives whenever the next entry carries any `toolResults` at all,
+        // matching ids or not, and `injectSyntheticToolCalls` only rescues
+        // orphaned RESULTS. A mismatched pair — both partners present, paired
+        // with each other's counterpart — passes both passes untouched and is
+        // rejected on the wire with `400 TOOL_USE_RESULT_MISMATCH`.
+        //
+        // Observed 2026-08-14: a caller whose transcript interleaved two
+        // concurrent tool executions sent exactly that shape, and because the
+        // retry resends identical history the session was terminally wedged.
+        //
+        // Repair runs on the WHOLE conversation and is split back afterwards.
+        // Repairing `history` alone would be wrong in the ordinary case: its
+        // last entry is normally the assistant whose `toolUses` this very
+        // request answers, so rule 4 would synthesize a FAILED result for a call
+        // whose real output is sitting in the current message.
+        //
+        // Still never throws. `remaining` is what repair could not express, and
+        // that — not merely "input was invalid" — is what earns the warning.
+        const conversationEntries = kiroConversationEntries(history, {
+          content: currentContent,
+          modelId: kiroModelId,
+          origin: "KIRO_CLI",
+          ...(uimc ? { userInputMessageContext: uimc } : {}),
+        });
+        const repair = repairKiroConversation(conversationEntries);
+        if (repair.diagnostics.length > 0) {
+          debugLog("request.invariants", { errors: repair.diagnostics, remaining: repair.remaining });
+        }
+        // Split back. Repair moves entries in only three ways, and each one keeps
+        // the current message last:
+        //   - step 1 drops a prefix, never a suffix;
+        //   - step 4 inserts a synthetic user turn only AFTER an assistant whose
+        //     uses nothing answers, and the current message is a user entry, so
+        //     no assistant is ever last;
+        //   - steps 2/3/5 rewrite entries in place.
+        // The one exception is total collapse: a conversation that is *only* a
+        // bare tool-result carrier has no valid opening entry, so step 1 consumes
+        // it and returns nothing. Because step 1 cannot skip past a survivor,
+        // `entries.length === 0` is the only shape where the current message is
+        // gone — anything longer keeps it at the end.
+        const repairedCurrent = repair.entries[repair.entries.length - 1]?.userInputMessage;
+        // `currentImages` is carried separately below and is not part of the
+        // repaired projection, so only text + context are read back here.
+        //
+        // Read the repaired context EXACTLY, including when repair removed it.
+        // A `?? uimc` fallback here would undo the repair in the one case that
+        // matters most: stripping every orphaned tool result leaves a turn with
+        // no context at all, and falling back would put the orphans — the shape
+        // the backend rejects — straight back onto the wire.
+        let wireHistory: KiroHistoryEntry[];
+        let wireContent: string;
+        let wireUimc: typeof uimc;
+        if (repairedCurrent) {
+          wireHistory = repair.entries.slice(0, -1);
+          wireContent = repairedCurrent.content;
+          wireUimc = repairedCurrent.userInputMessageContext;
+        } else {
+          // Collapsed. Apply what repair would have applied to a lone carrier:
+          // drop the results that answer nothing (steps 3), keep any tool
+          // catalog, and give the empty turn the neutral prompt (step 5).
+          wireHistory = [];
+          wireContent = currentContent || EMPTY_CONTENT_PLACEHOLDER;
+          wireUimc = uimc?.tools?.length ? { tools: uimc.tools } : undefined;
+        }
+        if (repair.remaining.length > 0) {
+          const structural = repair.remaining.filter((e) => isKiroToolStructureRule(e.rule));
+          if (structural.length > 0) {
+            console.warn(
+              `[pi-kiro-connect] outbound history still violates ${structural
+                .map((e) => `${e.rule}@${e.index}`)
+                .join(", ")} after repair — Kiro may reject this request`,
+            );
+          }
+        }
+        const request: KiroRequest = {
+          conversationState: {
+            chatTriggerType: "MANUAL",
+            agentTaskType: "vibe",
+            conversationId,
+            currentMessage: {
+              userInputMessage: {
+                content: sanitizeSurrogates(wireContent),
+                modelId: kiroModelId,
+                origin: "KIRO_CLI",
+                ...(currentImages ? { images: currentImages } : {}),
+                ...(wireUimc ? { userInputMessageContext: wireUimc } : {}),
+              },
+            },
+            ...(wireHistory.length > 0 ? { history: wireHistory } : {}),
+          },
+          ...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
+          profileArn,
+          agentMode: "vibe",
+        };
+        let response!: Response;
+        // Reset per outer iteration — each 403 retry gets a fresh capacity budget
+        let capacityRetryCount = 0;
+        // Inner loop: retry capacity errors without consuming outer retry budget
+        while (true) {
+          const mid = crypto.randomUUID().replace(/-/g, "");
+          const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${mid}`;
+          debugLog("request.send", {
+            attempt: retryCount,
+            capacityAttempt: capacityRetryCount,
+            // Wire values, not pre-repair ones: this line is what a reader
+            // correlates against a 400, so it must describe the bytes actually
+            // sent. `toolResultCount` likewise counts the repaired carrier,
+            // which may include synthesized results the raw turn never had.
+            historyLen: wireHistory.length,
+            currentContentLen: wireContent.length,
+            hasImages: !!currentImages,
+            toolResultCount: wireUimc?.toolResults?.length ?? 0,
+            request,
+          });
+          const responseHeaderDeadline = createResponseHeaderDeadline(
+            options?.signal,
+            retryConfig.requestHeaderTimeoutMs,
+          );
+          let responseHeadersTimedOut = false;
+          try {
+            response = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "application/vnd.amazon.eventstream",
+                ...kiroAuthHeaders(accessToken),
+                ...kiroTokenTypeHeaders(accessToken),
+                "x-amzn-codewhisperer-optout": "true",
+                "amz-sdk-invocation-id": crypto.randomUUID(),
+                "amz-sdk-request": "attempt=1; max=1",
+                "x-amzn-kiro-agent-mode": "vibe",
+                "x-amz-user-agent": ua,
+                "user-agent": ua,
+              },
+              body: JSON.stringify(request),
+              signal: responseHeaderDeadline.signal,
+            });
+          } catch (error) {
+            if (!responseHeaderDeadline.didTimeout() || options?.signal?.aborted) throw error;
+            responseHeadersTimedOut = true;
+          } finally {
+            responseHeaderDeadline.cleanup();
+          }
+          if (responseHeadersTimedOut) {
+            if (retryCount >= maxRetries) {
+              throw new Error("Kiro API error: response headers timeout after max retries");
+            }
+            retryCount++;
+            const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY);
+            await abortableDelay(delayMs, options?.signal);
+            continue requestLoop;
+          }
+          if (!response.ok) {
+            let errText = "";
+            try {
+              errText = redactSensitiveText(await response.text());
+            } catch {
+              errText = "";
+            }
+            const safeStatusText = redactSensitiveText(response.statusText);
+            const reasonCode = extractKiroReason(errText);
+            const isRequestRateExceeded =
+              response.status === 429 &&
+              reasonCode === KIRO_REASON_CODES.USER_REQUEST_RATE_EXCEEDED &&
+              !isNonRetryableBodyError(errText) &&
+              !isCapacityError(errText);
+            debugLog("response.error", {
+              status: response.status,
+              statusText: safeStatusText,
+              ...(isRequestRateExceeded ? { reasonCode } : { body: errText }),
+            });
+            // Retry transient capacity errors with longer backoff
+            if (isCapacityError(errText) && capacityRetryCount < capacityRetryConfig.maxRetries) {
+              capacityRetryCount++;
+              capacityRetryTotal++;
+              const delayMs = exponentialBackoff(capacityRetryCount - 1, capacityRetryConfig.baseDelayMs, 30_000);
+              const msg = `INSUFFICIENT_MODEL_CAPACITY — retrying in ${delayMs}ms (${capacityRetryCount}/${capacityRetryConfig.maxRetries})`;
+              logCapacityEvent(msg);
+              await abortableDelay(delayMs, options?.signal);
+              continue;
+            }
+            if (isCapacityError(errText)) {
+              logCapacityEvent(
+                `INSUFFICIENT_MODEL_CAPACITY — exhausted ${capacityRetryConfig.maxRetries} retries, giving up`,
+              );
+            }
+            if (isRequestRateExceeded) {
+              if (retryCount >= maxRetries) {
+                throw new Error(
+                  `Kiro API error: request window retry budget exhausted (${KIRO_REASON_CODES.USER_REQUEST_RATE_EXCEEDED})`,
+                );
+              }
+              retryCount++;
+              const retryDelay = resolveRequestRateRetryDelay(response.headers);
+              debugLog("request.rateWindowRetry", {
+                attempt: retryCount,
+                maxRetries,
+                delayMs: retryDelay.delayMs,
+                advertisedDelayMs: retryDelay.advertisedDelayMs,
+                capped: retryDelay.capped,
+                reasonCode,
+              });
+              await abortableDelay(retryDelay.delayMs, options?.signal);
+              continue requestLoop;
+            }
+            if (response.status === 403 && !isCapacityError(errText) && retryCount < maxRetries) {
+              retryCount++;
+              credentialRefreshTotal++;
+              // Re-read the shared store first in case another process already
+              // rotated the token. If it still contains the rejected token,
+              // force kiro-cli to refresh before retrying runtime.
+              invalidateKiroProfileArn(managementAuth);
+              const rejectedAccessToken = accessToken;
+              const rejectedProfileArn = profileArn;
+              const storedCreds = getKiroCliCredentials();
+              const rejectedCliCreds =
+                storedCreds?.access === rejectedAccessToken
+                  ? storedCreds
+                  : cliCreds?.access === rejectedAccessToken
+                    ? cliCreds
+                    : undefined;
+              const freshCreds: ReturnType<typeof getKiroCliCredentials> =
+                storedCreds?.access && storedCreds.access !== rejectedAccessToken ? storedCreds : refreshViaKiroCli();
+              const forcedRefresh = !(storedCreds?.access && storedCreds.access !== rejectedAccessToken);
+              if (freshCreds?.access) accessToken = freshCreds.access;
+              refreshTrace.push(
+                !freshCreds?.access
+                  ? `runtime-403 #${retryCount}: ${forcedRefresh ? "refresh returned no token" : "store had no fresh token"}`
+                  : freshCreds.access === rejectedAccessToken
+                    ? `runtime-403 #${retryCount}: refreshed token identical (entitlement?)`
+                    : forcedRefresh
+                      ? `runtime-403 #${retryCount}: refreshed via kiro-cli`
+                      : `runtime-403 #${retryCount}: adopted token from store`,
+              );
+              // Hand the refreshed credential back to the host so it survives the
+              // call. Guarded on a genuine change inside writeBackCredential.
+              if (freshCreds?.access) writeBackCredential(freshCreds, rejectedAccessToken);
+              managementAuth = { accessToken, region };
+
+              // Social profiles may not be discoverable through management.
+              // Carry the profile used by the rejected request only across a
+              // confirmed desktop-to-desktop credential replacement.
+              const inheritedDesktopProfileArn =
+                rejectedCliCreds?.authMethod === "desktop" && freshCreds?.authMethod === "desktop"
+                  ? rejectedProfileArn
+                  : undefined;
+              profileArn =
+                freshCreds?.profileArn ||
+                inheritedDesktopProfileArn ||
+                (skipProfileResolutionForTests ? TEST_PROFILE_ARN : await resolveKiroProfileArn(managementAuth));
+              // A replacement credential can carry a profile in another region,
+              // so re-pin the runtime host before retrying.
+              runtimeRegion = getKiroRegionFromProfileArn(profileArn) ?? region;
+              endpoint = new URL("generateAssistantResponse", getKiroEndpoints(runtimeRegion).runtime).toString();
+              const delayMs = exponentialBackoff(retryCount - 1, 500, MAX_RETRY_DELAY);
+              await abortableDelay(delayMs, options?.signal);
+              break; // break inner loop, continue outer loop
+            }
+            // Avoid pi-coding-agent's outer auto-retry from treating known
+            // Kiro quota/capacity body markers as generic retryable 429s.
+            // This covers both hard quota (MONTHLY_REQUEST_COUNT) and
+            // exhausted capacity retries (INSUFFICIENT_MODEL_CAPACITY).
+            //
+            // The three throws below carry identical `message` text to what this
+            // provider has always emitted — pi-ai, pi-coding-agent, and
+            // downstream consumers all string-match it. KiroApiError adds the
+            // classification as typed fields alongside that text; it never
+            // changes it.
+            const errorMeta = {
+              reasonCode: extractKiroReasonCode(errText),
+              retryAfterMs: parseRetryAfterMs(response.headers),
+              providerAttempts: { credentialRefresh: credentialRefreshTotal, capacity: capacityRetryTotal },
+            };
+            if (isNonRetryableBodyError(errText) || isCapacityError(errText)) {
+              throw new KiroApiError(
+                `Kiro API error: ${errText || safeStatusText}`,
+                response.status,
+                errorMeta.reasonCode,
+                errorMeta.retryAfterMs,
+                errorMeta.providerAttempts,
+              );
+            }
+            // Format error so pi-ai's isContextOverflow() recognizes it
+            if (isTooBigError(response.status, errText)) {
+              throw new KiroApiError(
+                `Kiro API error: context_length_exceeded (${response.status} ${errText})`,
+                response.status,
+                errorMeta.reasonCode,
+                errorMeta.retryAfterMs,
+                errorMeta.providerAttempts,
+              );
+            }
+            throw new KiroApiError(
+              `Kiro API error: ${response.status} ${safeStatusText} ${errText}`,
+              response.status,
+              errorMeta.reasonCode,
+              errorMeta.retryAfterMs,
+              errorMeta.providerAttempts,
+            );
+          }
+          break; // success, break inner loop
+        }
+        if (capacityRetryCount > 0 && response.ok) {
+          logCapacityEvent(`INSUFFICIENT_MODEL_CAPACITY — succeeded after ${capacityRetryCount} retries`);
+        }
+        // 403 retry: continue outer loop
+        if (!response.ok) continue;
+        stream.push({ type: "start", partial: output });
+        if (!response.body) throw new Error("No response body");
+        const bodyReader = (response.body as unknown as ReadableStream<Uint8Array>).getReader();
+        // Cancel the body read as soon as the caller aborts (e.g. user presses
+        // Esc mid-stream). Without this, the read loop below keeps consuming
+        // the event stream until the server finishes the response, which makes
+        // an interrupt appear to hang for the remainder of the generation.
+        const callerSignal = options?.signal;
+        const onCallerStreamAbort = () => {
+          void bodyReader.cancel().catch(() => {});
+        };
+        if (callerSignal?.aborted) onCallerStreamAbort();
+        else callerSignal?.addEventListener("abort", onCallerStreamAbort, { once: true });
+        let totalContent = "";
+        let usageEvent: KiroUsageData | null = null;
+        let meteringEvent: { credits?: number; unit?: string } | null = null;
+        let receivedContextUsage = false;
+        const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+        let nativeThinkingBlockIndex: number | null = null;
+        let nativeThinkingEnded = false;
+        const ensureNativeThinkingBlock = (): { block: ThinkingContent; contentIndex: number } => {
+          if (nativeThinkingBlockIndex === null) {
+            nativeThinkingBlockIndex = output.content.length;
+            output.content.push({ type: "thinking", thinking: "" });
+            stream.push({ type: "thinking_start", contentIndex: nativeThinkingBlockIndex, partial: output });
+          }
+          return {
+            block: output.content[nativeThinkingBlockIndex] as ThinkingContent,
+            contentIndex: nativeThinkingBlockIndex,
+          };
+        };
+        const endNativeThinking = () => {
+          if (nativeThinkingBlockIndex === null || nativeThinkingEnded) return;
+          nativeThinkingEnded = true;
+          const block = output.content[nativeThinkingBlockIndex] as ThinkingContent;
+          stream.push({
+            type: "thinking_end",
+            contentIndex: nativeThinkingBlockIndex,
+            content: block.thinking,
+            partial: output,
+          });
+        };
+        let textBlockIndex: number | null = null;
+        let emittedToolCalls = 0;
+        let sawAnyToolCalls = false;
+        /** Names of tool calls `emitToolCall` refused because their arguments would
+         *  not parse. Per-attempt, like `emittedToolCalls`: a retry must not inherit
+         *  a discarded attempt's drops. */
+        const droppedToolCalls: unknown[] = [];
+        let currentToolCall: KiroToolCallState | null = null;
+        const flushToolCall = () => {
+          if (!currentToolCall) return;
+          if (emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
+          else droppedToolCalls.push(currentToolCall.name);
+          currentToolCall = null;
+        };
+        const IDLE_TIMEOUT = 300_000;
+        let idleTimer: ReturnType<typeof setTimeout> | null = null;
+        let idleCancelled = false;
+        const resetIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            idleCancelled = true;
+            void bodyReader.cancel().catch(() => {});
+          }, IDLE_TIMEOUT);
+        };
+        let gotFirstToken = false;
+        let firstTokenTimedOut = false;
+        let streamError: string | null = null;
+        // Structured detail for the last modeled exception frame. The message
+        // string stays the retry/throw contract; this keeps `kind`, `reason`,
+        // and `retryAfterMilliseconds` addressable instead of only readable as
+        // prose inside that string.
+        let streamErrorData: KiroErrorData | null = null;
+        const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
+
+        // Smithy EventStreamMarshaller handles: chunk reassembly, CRC validation,
+        // protocol error/exception detection, and payload deserialization.
+        const bodyIterable: AsyncIterable<Uint8Array> = {
+          async *[Symbol.asyncIterator]() {
+            try {
+              while (true) {
+                const { done, value } = await bodyReader.read();
+                if (done) return;
+                yield value;
+              }
+            } finally {
+              bodyReader.releaseLock();
+            }
+          },
+        };
+        const utf8Decoder = new TextDecoder();
+        const eventStream = eventStreamMarshaller.deserialize(bodyIterable, async (event: Record<string, Message>) => {
+          const entry = Object.entries(event)[0];
+          if (!entry) throw new Error("Received an empty event stream message");
+          const [key, msg] = entry;
+          // The four error members of ChatResponseStream target `@error` shapes,
+          // so the service frames them as `:message-type: exception`. The
+          // marshaller keys those by `:exception-type` and throws whatever this
+          // callback returns, so returning the bare payload would discard the
+          // modeled class. Return an Error carrying the parsed detail instead.
+          if (msg.headers[":message-type"]?.value === "exception") {
+            // Parsed defensively, and BEFORE the shared parse below: an exception
+            // body that is empty or not JSON would otherwise throw a SyntaxError
+            // out of this deserializer, and the caller would report
+            // "Unexpected end of JSON input" with the modeled class gone — the
+            // exact loss this routing removes. The class lives in the header, so
+            // it survives a body we cannot read. The same-service client's own
+            // bridge takes this position too (sse-middleware.ts: "Non-JSON body:
+            // still throw a typed exception with a fallback message").
+            let parsedException: Record<string, unknown> = {};
+            try {
+              const decoded = JSON.parse(utf8Decoder.decode(msg.body)) as unknown;
+              if (decoded && typeof decoded === "object") parsedException = decoded as Record<string, unknown>;
+            } catch {
+              // Header-only classification below.
+            }
+            // An unmodeled member (a fifth error added server-side, or `$unknown`)
+            // still arrives keyed by `:exception-type`. Smithy's own fail-open path
+            // is unreachable here — it only triggers when the deserializer returns
+            // a `$unknown` property, which this one never does — so without a
+            // fallback the marshaller would throw the bare parsed body and the
+            // member name would be lost in exactly the way this routing exists to
+            // prevent. Synthesize the same typed shape with `kind: "unknown"`.
+            const data: KiroErrorData = parseKiroExceptionFrame(key, parsedException) ?? {
+              error: key,
+              kind: "unknown",
+              ...(typeof parsedException.message === "string" ? { message: parsedException.message } : {}),
+              ...(typeof parsedException.reason === "string" ? { reason: parsedException.reason } : {}),
+              ...(typeof parsedException.retryAfterMilliseconds === "number"
+                ? { retryAfterMilliseconds: parsedException.retryAfterMilliseconds }
+                : {}),
+            };
+            const error = new Error(data.message ? `${data.error}: ${data.message}` : data.error);
+            error.name = data.error;
+            (error as Error & { kiroError?: KiroErrorData }).kiroError = data;
+            return { [key]: error } as Record<string, unknown>;
+          }
+          const parsed = JSON.parse(utf8Decoder.decode(msg.body)) as Record<string, unknown>;
+          return { [key]: parsed } as Record<string, unknown>;
+        });
+        const iterator = eventStream[Symbol.asyncIterator]() as AsyncIterator<Record<string, unknown>>;
+
+        while (true) {
+          if (callerSignal?.aborted) break;
+          let iterResult: IteratorResult<Record<string, unknown>>;
+          try {
+            if (!gotFirstToken) {
+              const readPromise = iterator.next();
+              let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                const result = await Promise.race([
+                  readPromise,
+                  new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
+                    firstTokenTimer = setTimeout(
+                      () => resolve(FIRST_TOKEN_SENTINEL),
+                      firstTokenTimeoutForModel(model.id),
+                    );
+                  }),
+                ]);
+                if (result === FIRST_TOKEN_SENTINEL) {
+                  readPromise.catch(() => {}); // suppress dangling rejection
+                  void bodyReader.cancel().catch(() => {});
+                  firstTokenTimedOut = true;
+                  break;
+                }
+                iterResult = result as IteratorResult<Record<string, unknown>>;
+                gotFirstToken = true;
+                resetIdle();
+              } finally {
+                // The losing timeout branch of the race must not keep a ref'd
+                // timer alive until it fires: an uncleared 90 s handle holds
+                // the Node event loop open long after print-mode/SDK callers
+                // have finished their turn (#154).
+                if (firstTokenTimer !== undefined) clearTimeout(firstTokenTimer);
+              }
+            } else {
+              iterResult = await iterator.next();
+            }
+          } catch (e) {
+            // Smithy throws on :message-type error/exception headers. A modeled
+            // exception frame arrives here as the Error built in the
+            // deserializer above, with its parsed detail attached.
+            const kiroError = (e as { kiroError?: KiroErrorData } | null)?.kiroError;
+            if (kiroError) streamErrorData = kiroError;
+            streamError =
+              e instanceof Error
+                ? e.message
+                : (typeof e === "object" && e !== null ? JSON.stringify(e) : String(e)) || "Unknown stream error";
+            break;
+          }
+          const { done, value } = iterResult;
+          if (done) break;
+          resetIdle();
+          // The marshaller keys each frame by its modeled `ChatResponseStream`
+          // union member (from the `:event-type` header). Route on that key
+          // instead of guessing the member from which fields are populated.
+          const frameEntry = Object.entries(value as Record<string, unknown>)[0];
+          if (!frameEntry) continue;
+          const [frameKey, framePayload] = frameEntry;
+          const event = parseKiroEvent(frameKey, (framePayload ?? {}) as Record<string, unknown>);
+          if (!event) continue;
+          if (event.type === "ignored") {
+            if (debugEnabled()) debugLog("stream.events.ignored", [event.data.key]);
+            continue;
+          }
+          if (debugEnabled()) debugLog("stream.events", [event]);
+          switch (event.type) {
+            case "contextUsage": {
+              const pct = event.data.contextUsagePercentage;
+              output.usage.input = Math.round((pct / 100) * model.contextWindow);
+              (output.usage as unknown as Record<string, unknown>).contextPercent = pct;
+              receivedContextUsage = true;
+              break;
+            }
+            case "thinkingText": {
+              if (!thinkingEnabled) break;
+              const { block, contentIndex } = ensureNativeThinkingBlock();
+              block.thinking += event.data;
+              totalContent += event.data;
+              stream.push({
+                type: "thinking_delta",
+                contentIndex,
+                delta: event.data,
+                partial: output,
+              });
+              break;
+            }
+            case "thinkingSignature": {
+              if (!thinkingEnabled) break;
+              const { block } = ensureNativeThinkingBlock();
+              block.thinkingSignature = event.data;
+              endNativeThinking();
+              break;
+            }
+            case "content": {
+              if (event.data === "") break;
+              endNativeThinking();
+              totalContent += event.data;
+              if (thinkingParser) {
+                thinkingParser.processChunk(event.data);
+              } else {
+                if (textBlockIndex === null) {
+                  textBlockIndex = output.content.length;
+                  output.content.push({ type: "text", text: "" });
+                  stream.push({ type: "text_start", contentIndex: textBlockIndex, partial: output });
+                }
+                (output.content[textBlockIndex] as TextContent).text += event.data;
+                stream.push({ type: "text_delta", contentIndex: textBlockIndex, delta: event.data, partial: output });
+              }
+              break;
+            }
+            case "toolUse": {
+              const tc = event.data;
+              sawAnyToolCalls = true;
+              if (!currentToolCall || currentToolCall.toolUseId !== tc.toolUseId) {
+                flushToolCall();
+                currentToolCall = { toolUseId: tc.toolUseId, name: tc.name, input: "" };
+              }
+              currentToolCall.input += tc.input || "";
+              if (tc.input) totalContent += tc.input;
+              if (tc.stop) flushToolCall();
+              break;
+            }
+            case "toolUseInput": {
+              if (currentToolCall) currentToolCall.input += event.data.input || "";
+              if (event.data.input) totalContent += event.data.input;
+              break;
+            }
+            case "toolUseStop": {
+              if (event.data.stop) flushToolCall();
+              break;
+            }
+            case "usage": {
+              // Every MetadataEvent field is optional, so the service may split
+              // tokenUsage and stopReason/stopDetails across frames. Merge so a
+              // later partial frame cannot erase counts already received.
+              const prev: KiroUsageData = usageEvent ?? {};
+              usageEvent = { ...prev, ...event.data };
+              if (event.data.contextUsagePercentage !== undefined) {
+                (output.usage as unknown as Record<string, unknown>).contextPercent = event.data.contextUsagePercentage;
+                receivedContextUsage = true;
+              }
+              break;
+            }
+            case "metering": {
+              meteringEvent = event.data;
+              if (debugEnabled()) debugLog("stream.metering", [event.data]);
+              break;
+            }
+            case "error": {
+              const errMsg = event.data.message ? `${event.data.error}: ${event.data.message}` : event.data.error;
+              streamError = errMsg;
+              streamErrorData = event.data;
+              void bodyReader.cancel().catch(() => {});
+              break;
+            }
+            // followupPrompt events are intentionally ignored
+          }
+          if (streamError) break;
+        }
+        if (idleTimer) clearTimeout(idleTimer);
+        callerSignal?.removeEventListener("abort", onCallerStreamAbort);
+        if (callerSignal?.aborted) {
+          // Surface the abort instead of treating the cancelled read as a
+          // retryable stream error; the outer catch maps this to
+          // stopReason "aborted".
+          throw callerSignal.reason ?? new Error("Request aborted");
+        }
+        if (firstTokenTimedOut || idleCancelled || streamError) {
+          // Timed out or received error mid-stream: retry with backoff
+          if (retryCount < maxRetries) {
+            retryCount++;
+            const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY);
+            if (streamErrorData && debugEnabled()) {
+              debugLog("stream.error.typed", [streamErrorData]);
+            }
+            // `output` is created once outside the retry loop, so anything the
+            // aborted attempt already appended survives into the next one. A
+            // typed error frame (throttling/validation/serviceUnavailable) can
+            // arrive after partial text, which would otherwise concatenate the
+            // abandoned prefix onto the retried response. The empty-response
+            // retry below resets for the same reason. `textBlockIndex` and the
+            // tool-call state are per-iteration and need no reset here; the
+            // usage block is cleared by `resetAttemptUsage` at the loop top.
+            //
+            // pi's event protocol has no retraction event, so deltas already
+            // pushed for the abandoned attempt cannot be withdrawn. The signals
+            // a consumer does get are the fresh `start` emitted for the retried
+            // attempt and the `partial` carried on every event, which is this
+            // same `output` object and so reflects the clear.
+            output.content = [];
+            await abortableDelay(delayMs, options?.signal);
+            continue;
+          }
+          if (streamError) {
+            throw new Error(`Kiro API stream error after max retries: ${streamError}`);
+          }
+          throw new Error(`Kiro API error: ${firstTokenTimedOut ? "first token" : "idle"} timeout after max retries`);
+        }
+        if (currentToolCall) {
+          if (emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
+          else droppedToolCalls.push(currentToolCall.name);
+        }
+        endNativeThinking();
+        if (thinkingParser) {
+          thinkingParser.finalize();
+          textBlockIndex = thinkingParser.getTextBlockIndex();
+        }
+        // Fallback: extract text-dialect tool calls from content if no native
+        // tool calls arrived. Three dialects are recovered at this seam:
+        //   1. Kiro's own `[Called name with args: {...}]` bracket form.
+        //   2. Anthropic's `<invoke name="..."><parameter .../></invoke>` XML
+        //      form, which opus-class models emit as plain text at high context.
+        //   3. The `<tool_use>{JSON}</tool_use>` form, another shape opus-class
+        //      models fall back to (JSON descriptor with tool_name/tool_input,
+        //      name/input, or name/arguments field spellings).
+        // Without this, the turn ends `stopReason:"stop"` with zero tool calls —
+        // the agent loop sees a finished answer and an unattended session stalls
+        // indefinitely with no error recorded anywhere.
+        //
+        // Never reinterpret text for models that opt out, including Claude.
+        // Native malformed tool calls remain errors rather than triggering recovery.
+        if (modelMetadata.recoverTextToolCalls !== false && !sawAnyToolCalls && textBlockIndex !== null) {
+          const textBlock = output.content[textBlockIndex] as TextContent;
+          const recovered: Array<{ toolUseId: string; name: string; arguments: Record<string, unknown> }> = [];
+          const bracketResult = parseBracketToolCalls(textBlock.text);
+          if (bracketResult.toolCalls.length > 0) {
+            textBlock.text = bracketResult.cleanedText;
+            recovered.push(...bracketResult.toolCalls);
+          }
+          const invokeResult = parseInvokeToolCalls(textBlock.text);
+          if (invokeResult.toolCalls.length > 0) {
+            textBlock.text = invokeResult.cleanedText;
+            recovered.push(...invokeResult.toolCalls);
+          }
+          const toolUseResult = parseToolUseCalls(textBlock.text);
+          if (toolUseResult.toolCalls.length > 0) {
+            textBlock.text = toolUseResult.cleanedText;
+            recovered.push(...toolUseResult.toolCalls);
+          }
+          if (recovered.length > 0) {
+            sawAnyToolCalls = true;
+            for (const btc of recovered) {
+              if (
+                emitToolCall(
+                  {
+                    toolUseId: btc.toolUseId,
+                    name: btc.name,
+                    input: JSON.stringify(btc.arguments),
+                  },
+                  output,
+                  stream,
+                )
+              ) {
+                emittedToolCalls++;
+              } else {
+                // Unreachable as written, and kept deliberately. Both dialects hand
+                // over an in-memory object — bracket-tool-parser's is itself a
+                // successful `JSON.parse` result, invoke-tool-parser's is a record of
+                // raw parameter strings — so `JSON.stringify` of either always
+                // round-trips and `emitToolCall`'s only `false` return, a
+                // `JSON.parse` throw, cannot fire here. No test pins this branch,
+                // because no wire input can reach it. It stays so that a future
+                // parser change passing raw text through cannot silently reintroduce
+                // the very dropped-call blindness this change exists to remove.
+                droppedToolCalls.push(btc.name);
+              }
+            }
+          }
+        }
+        // Strip echo noise: when tool calls are present and the text content
+        // is just "." or similar short echo from history padding, remove it.
+        // This prevents the echo from accumulating in conversation history
+        // and reinforcing the pattern in future turns.
+        if (emittedToolCalls > 0 && textBlockIndex !== null) {
+          const textBlock = output.content[textBlockIndex] as TextContent;
+          if (/^\s*(\.+|continue)\s*$/i.test(textBlock.text)) {
+            textBlock.text = "";
+          }
+        }
+        if (textBlockIndex !== null)
+          stream.push({
+            type: "text_end",
+            contentIndex: textBlockIndex,
+            content: (output.content[textBlockIndex] as TextContent).text,
+            partial: output,
+          });
+        // The Kiro streaming API does not reliably emit per-response output
+        // token counts (unlike Anthropic's `output_tokens` or Bedrock's
+        // `usage.outputTokens`). When the `usage` event is missing or only
+        // reports `inputTokens`, fall back to a tiktoken estimate over
+        // everything the assistant emitted — text plus tool-call input JSON
+        // (accumulated into `totalContent` above). Otherwise tool-call-only
+        // turns report 0 output tokens and break consumers like the TPS
+        // extension that watch `usage.output`.
+        //
+        // `KiroUsageData.inputTokens` is `TokenUsage.uncachedInputTokens` — the
+        // input billed at full rate, NOT total input. pi's `usage.input` is the
+        // same uncached slot, with `cacheRead`/`cacheWrite` as siblings, and
+        // `calculateCost` prices all three separately. So the cache counts must
+        // land whenever `input` is taken from the wire; otherwise a cached turn
+        // reports a fraction of its real input and is priced far too low.
+        if (usageEvent?.inputTokens !== undefined) output.usage.input = usageEvent.inputTokens;
+        if (usageEvent?.cacheReadInputTokens !== undefined) output.usage.cacheRead = usageEvent.cacheReadInputTokens;
+        if (usageEvent?.cacheWriteInputTokens !== undefined) output.usage.cacheWrite = usageEvent.cacheWriteInputTokens;
+        output.usage.output = usageEvent?.outputTokens ?? countTokens(totalContent);
+        // `TokenUsage.totalTokens` is required on the wire while the cache counts
+        // are optional, so the service's own total is the authoritative figure —
+        // recomputing from components silently under-reports whenever a component
+        // is omitted. Prefer it and fall back to the sum, matching how pi's
+        // bedrock adapter treats the one other wire that supplies a total.
+        output.usage.totalTokens =
+          usageEvent?.totalTokens ??
+          output.usage.input + output.usage.cacheRead + output.usage.cacheWrite + output.usage.output;
+        try {
+          PiAi.calculateCost(model, output.usage);
+        } catch {
+          // Model might not have cost info, use zeros
+          output.usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+        }
+        // Detect degenerate responses: the API returned 200 but produced no
+        // usable content at all — no text and no tool calls (not even broken
+        // ones). This happens when the stream is truncated early or the API
+        // returns only a contextUsage event. Retry with backoff.
+        //
+        // Also detect "Continue" echo loops: the model's entire response is
+        // just "continue" (case-insensitive) with no tool calls. This happens
+        // when synthetic history padding teaches the model to echo "Continue"
+        // as a valid response, causing an infinite loop where pi sends
+        // "continue" back and the model echoes it again.
+        //
+        // When tool calls *were* present but all got dropped (empty/unparseable
+        // input), don't retry — the API did respond, it just sent malformed
+        // tool calls. Retrying would likely produce the same result. The
+        // stopReason fix below prevents the agent loop stall.
+        const hasText = textBlockIndex !== null && (output.content[textBlockIndex] as TextContent).text.length > 0;
+        const responseText = hasText ? (output.content[textBlockIndex as number] as TextContent).text : "";
+        const isEchoLoop = hasText && !sawAnyToolCalls && /^\s*(continue|\.+)\s*$/i.test(responseText);
+        // Explicit completion/refusal metadata is authoritative, including empty turns.
+        const explicitStop = usageEvent?.rawStopReason;
+        const degenerate = !explicitStop && ((!hasText && !sawAnyToolCalls) || isEchoLoop);
+        if (degenerate && isEchoLoop) echoAttempts++;
+        else if (degenerate) emptyAttempts++;
+        const exhausted = degenerate && retryCount >= maxRetries;
+        // Use emittedToolCalls (not toolCalls.length) to avoid stopReason:"toolUse"
+        // when all tool calls were skipped due to empty/unparseable input — that
+        // combination (empty content + toolUse stop) causes pi's agent loop to
+        // stall waiting for tool results that will never arrive.
+        //
+        // Resolved BEFORE the retry-exhaustion warnings below so those warnings can
+        // report the value actually assigned. It reads only `receivedContextUsage`
+        // and `emittedToolCalls`, neither of which the exhaustion branch touches.
+        switch (explicitStop) {
+          case "MAX_TOKENS":
+            output.stopReason = "length";
+            break;
+          case "MODEL_CONTEXT_WINDOW_EXCEEDED":
+            throw new Error("Kiro API error: context_length_exceeded");
+          case "CONTENT_FILTERED":
+            // Do not retry a refusal or execute any accompanying tool calls.
+            output.content = output.content.filter((block) => block.type !== "toolCall");
+            throw new Error(`Kiro content filtered: ${JSON.stringify(usageEvent?.stopDetails ?? {})}`);
+          case "PAUSE_TURN":
+            throw new Error("Kiro paused the turn; automatic continuation is not supported");
+          case "END_TURN":
+            output.stopReason = "stop";
+            break;
+          case "TOOL_USE":
+            output.stopReason = emittedToolCalls > 0 ? "toolUse" : "stop";
+            break;
+          default:
+            output.stopReason = emittedToolCalls > 0 ? "toolUse" : receivedContextUsage ? "stop" : "length";
+        }
+        if (degenerate) {
+          if (!exhausted) {
+            retryCount++;
+            const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY);
+            console.warn(
+              `[pi-kiro-connect] ${isEchoLoop ? 'Echo loop detected (model responded with just "Continue")' : "Empty response (no text, no tool calls)"} — retrying (${retryCount}/${maxRetries})`,
+            );
+            // Reset output content for the retry
+            output.content = [];
+            textBlockIndex = null;
+            await abortableDelay(delayMs, options?.signal);
+            continue;
+          }
+          // Retries are spent and the turn still carries nothing usable. The
+          // stopReason has to stay in pi's existing union (a new member would
+          // break every peer), so the only channel that can say a turn failed
+          // while it still looks successful is `errorMessage`. Without it these
+          // turns are indistinguishable from an ordinary completion.
+          //
+          // Deliberately NOT worded as a transient/transport failure: this is
+          // terminal, so consumer retry classifiers must not match it and hand
+          // it another doomed attempt. Consumers split three ways on the exact
+          // strings below, measured rather than assumed:
+          //
+          //  - Read the field with NO stopReason gate, and fail the run on any
+          //    non-retryable value: Kermes `headless.ts` (`exit = 1`) and
+          //    `acp_server/agent.ts` (`hadError`). These are the paths the
+          //    diagnostic actually reaches, and because it is worded terminal it
+          //    is NOT suppressed — a silent turn that used to exit 0 now fails
+          //    loudly. That is the intended consequence, not a side effect.
+          //  - Cannot be reached by this field at all, so they stay correctly
+          //    inert: pi-ai's `isRetryableAssistantError` requires
+          //    `stopReason === "error"`, and of `isContextOverflow`'s three
+          //    branches only the first reads `errorMessage` (also behind that
+          //    same gate) — its silent-overflow and length-stop branches judge
+          //    `usage` alone and never read this field. Writing it therefore
+          //    changes neither verdict.
+          //  - Read the field unconditionally but only ACT on it behind a
+          //    `stopReason === "error"` classifier, so they persist nothing:
+          //    Kermes `session_reaper.ts` discards this on a non-error tail
+          //    (`stop_detail` is written only when a blocked verdict is
+          //    reached). Surfacing these in reap verdicts needs a consumer-side
+          //    change; it does not follow from writing the field here.
+          if (isEchoLoop) {
+            // After max retries, strip the echo text to prevent the agent
+            // loop from interpreting "Continue" as a continuation signal.
+            (output.content[textBlockIndex as number] as TextContent).text = "";
+            const alsoEmpty = emptyAttempts > 0 ? ` (plus ${describeAttempts(emptyAttempts)} with no text at all)` : "";
+            console.warn(
+              `[pi-kiro-connect] Echo loop persisted across ${describeAttempts(echoAttempts)}${alsoEmpty} — stripping "Continue" response (${responseText.length} chars)`,
+            );
+            output.errorMessage = `Kiro model echoed its own continuation prompt (${JSON.stringify(
+              clampForDiagnostic(responseText),
+            )}) on ${describeAttempts(
+              echoAttempts,
+            )}${alsoEmpty} and emitted no tool calls; retry budget exhausted, text stripped, stopReason:"${
+              output.stopReason
+            }"`;
+          } else {
+            const alsoEchoed =
+              echoAttempts > 0 ? ` (plus ${describeAttempts(echoAttempts)} that echoed the continuation prompt)` : "";
+            console.warn(
+              `[pi-kiro-connect] Empty response on ${describeAttempts(emptyAttempts)}${alsoEchoed}, retry budget exhausted — returning stopReason:"${output.stopReason}" to avoid agent loop stall`,
+            );
+            // Every surviving `text` or `toolCall` block was left by an attempt
+            // that was discarded; a `thinking` block may be this attempt's own.
+            // `describeReturnedContent` owns that partition and explains it.
+            output.errorMessage = `Kiro returned no text and no tool calls on ${describeAttempts(
+              emptyAttempts,
+            )}${alsoEchoed}; retry budget exhausted, ${describeReturnedContent(
+              output.content,
+            )} with stopReason:"${output.stopReason}"`;
+          }
+        }
+        // A tool call the model DID make never reached pi: its arguments would not
+        // parse, so `emitToolCall` dropped it (see that function). Nothing else
+        // records this — `sawAnyToolCalls` is already true, which is exactly what
+        // suppresses the empty-response retry above and the bracket fallback
+        // earlier, and the content array simply lacks a block. Unlike the two
+        // exhaustion cases, this one is unrecoverable downstream: the call is gone
+        // before the message is persisted.
+        if (droppedToolCalls.length > 0) {
+          const names = describeDroppedToolNames(droppedToolCalls);
+          // The reversible names or whole-set fingerprint identify the drops, so
+          // the count is not printed: it is unbounded (a turn may carry any
+          // number of malformed calls) and unbounded or wire-controlled text
+          // here can collide with a consumer's retryable-error pattern.
+          const one = droppedToolCalls.length === 1;
+          const dropDiagnostic = `Kiro sent ${one ? "a tool call" : "tool calls"} with unparseable arguments (${names}); ${
+            one ? "it was" : "they were"
+          } dropped and never reached the agent, stopReason:"${output.stopReason}"`;
+          // Concatenation is defensive: today the two diagnostics are mutually
+          // exclusive, because any drop sets `sawAnyToolCalls` and `degenerate`
+          // requires `!sawAnyToolCalls`. Kept so that loosening either predicate
+          // appends rather than silently overwriting an exhaustion diagnostic.
+          output.errorMessage = output.errorMessage ? `${output.errorMessage}. ${dropDiagnostic}` : dropDiagnostic;
+        }
+        if (!output.errorMessage) {
+          const estimatedRead = applyCacheEstimate(
+            conversationId,
+            output.usage,
+            usageEvent,
+            usageTracking,
+            output.timestamp,
+          );
+          if (estimatedRead > 0) {
+            debugLog("usage.estimate", {
+              conversationId,
+              estimatedRead,
+              input: output.usage.input,
+              cacheRead: output.usage.cacheRead,
+            });
+          }
+          const estimatedCost = estimateKiroCreditCost(usageTracking, meteringEvent);
+          if (estimatedCost !== undefined) output.usage.cost.total = estimatedCost;
+        }
+        stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
+        debugLog("response.done", {
+          stopReason: output.stopReason,
+          emittedToolCalls,
+          sawAnyToolCalls,
+          textLen: textBlockIndex !== null ? (output.content[textBlockIndex] as TextContent).text.length : 0,
+          usage: output.usage,
+          content: output.content,
+        });
+        stream.end();
+        break;
+      }
+    } catch (error) {
+      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+      output.errorMessage = formatSafeError(error);
+      // Surface the typed classification the throw site already computed.
+      // `errorMessage` is a flat string by contract, so without this a consumer
+      // has to regex the class back out of prose. Diagnostics are the sanctioned
+      // structured channel for exactly this ("provider/runtime diagnostics for
+      // failures and recoveries"). Oh My Pi's pi-ai shim lacks the diagnostic
+      // helpers and reads the HTTP status from `errorStatus` instead — including
+      // for a management-plane failure (e.g. GetProfile) before the runtime call.
+      if (error instanceof KiroApiError || error instanceof KiroManagementHttpError) {
+        (output as AssistantMessage & { errorStatus?: number }).errorStatus = error.status;
+      }
+      if (error instanceof KiroApiError) {
+        if (
+          typeof PiAi.appendAssistantMessageDiagnostic === "function" &&
+          typeof PiAi.createAssistantMessageDiagnostic === "function"
+        ) {
+          PiAi.appendAssistantMessageDiagnostic(
+            output,
+            PiAi.createAssistantMessageDiagnostic("kiro_api_error", error, {
+              status: error.status,
+              ...(error.reasonCode !== undefined ? { reasonCode: error.reasonCode } : {}),
+              ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+              ...(error.providerAttempts !== undefined ? { providerAttempts: error.providerAttempts } : {}),
+            }),
+          );
+        }
+      }
+      // For a host that owns credentials (it passed an accessor), surface this
+      // call's refresh decisions/outcomes onto the terminal error so an auth
+      // failure is decidable in the transcript. Appended on its own line so a
+      // line-oriented classifier still matches the original error grammar on the
+      // first line. Without an accessor the message is unchanged. Never on an
+      // abort — an aborted turn's refresh history is noise.
+      if (options?.credentialAccessor && output.stopReason !== "aborted" && refreshTrace.length > 0) {
+        output.errorMessage = `${output.errorMessage}\n[auth-refresh] ${refreshTrace.join("; ")}`;
+      }
+      debugLog("response.caught", { stopReason: output.stopReason, error: output.errorMessage, refreshTrace });
+      stream.push({ type: "error", reason: output.stopReason, error: output });
+      stream.end();
+    }
+  })().catch(() => {
+    // Safety net: catch any rejection that escapes the inner try/catch
+    // (e.g., AbortError during signal teardown). Without this, the
+    // fire-and-forget IIFE produces an unhandled rejection that crashes pi.
+    try {
+      stream.end();
+    } catch {}
+  });
+  return stream;
+}

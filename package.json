@@ -1,0 +1,95 @@
+{
+  "name": "pi-kiro-connect",
+  "version": "0.13.0",
+  "description": "Kiro (AWS CodeWhisperer/Q) provider for pi and Oh My Pi — kiro-cli-compatible login, live model catalog, credit usage",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "license": "MIT",
+  "author": "vnlebaoduy",
+  "contributors": [
+    "Mikey O'Brien (original pi-provider-kiro author)"
+  ],
+  "homepage": "https://github.com/vnlebaoduy/pi-kiro-connect#readme",
+  "bugs": {
+    "url": "https://github.com/vnlebaoduy/pi-kiro-connect/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vnlebaoduy/pi-kiro-connect.git"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "keywords": [
+    "pi-package",
+    "omp-plugin",
+    "pi",
+    "oh-my-pi",
+    "kiro",
+    "aws",
+    "codewhisperer",
+    "ai",
+    "provider"
+  ],
+  "files": [
+    "dist",
+    "src",
+    "scripts/install.sh",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --banner:js=\"import{createRequire as __kiroCreateRequire}from'node:module';const require=__kiroCreateRequire(import.meta.url);\" --external:@earendil-works/pi-ai --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-tui && tsc --emitDeclarationOnly",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run check && npm run build"
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@smithy/core": "^3.24.5",
+    "js-tiktoken": "^1.0.21"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.10",
+    "@earendil-works/pi-coding-agent": ">=0.80.10",
+    "@earendil-works/pi-tui": ">=0.80.10"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.2",
+    "@earendil-works/pi-ai": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
+    "@smithy/types": "^4.17.2",
+    "esbuild": "0.28.2",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

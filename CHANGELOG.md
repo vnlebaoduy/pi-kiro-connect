@@ -1,0 +1,346 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.13.0] - 2026-10-03
+
+First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://github.com/mikeyobrien/pi-provider-kiro) 0.12.1 at upstream commit `bb89d39`. Sections below 0.13.0 are the upstream history; their links point to the upstream repository.
+
+### Changed
+
+- Renamed the package to `pi-kiro-connect`. The settings key in `settings.json` is now `"pi-kiro-connect"` (was `"pi-provider-kiro"`), and log lines are prefixed `[pi-kiro-connect]`.
+- Installed from GitHub instead of npm. omp installs the tag directly. pi installs the `release/vX.Y.Z` branch, which carries the prebuilt `dist/`, because pi git installs skip the build. `scripts/install.sh` installs into whichever hosts are present and removes `pi-provider-kiro`.
+- IAM Identity Center and Builder ID sign-in now share kiro-cli's OIDC client. Login reuses the `Kiro CLI` registration kiro-cli already holds for the region, and registers a new one only when there is none or its secret is about to expire. On success it records the session exactly where kiro-cli keeps its own (`kirocli:odic:device-registration`, `kirocli:odic:token`, `auth.idc.start-url`, `auth.idc.region`), so either tool can refresh the other's token and AWS sees one client per user. Region detection tries kiro-cli's known region for the start URL first.
+- OIDC scopes match kiro-cli's: `codewhisperer:completions`, `codewhisperer:analysis`, `codewhisperer:conversations`. `transformations` and `taskassist` are no longer requested.
+- esbuild is now a devDependency (build-only); bumped to 0.28.2. It only produces `dist/index.js` and nothing in the published bundle imports it, yet as a runtime dependency every consumer installed esbuild 0.25.12 and its platform binary. Pinned exactly to match pi 0.87.1 (`@earendil-works/chord`). Both lockfiles now resolve a single esbuild (vite is deduped onto 0.28.2 too). `test/packaging.test.ts` pins esbuild's absence from `dependencies`.
+
+### Added
+
+- Report Kiro credit usage in Oh My Pi's `omp usage` and `/usage`.
+  The provider registers an OMP usage provider backed by `GetUsageLimits`, mapping each credit bucket to a monthly limit and free-trial bonus credits to a separate limit with its own expiry.
+  OAuth and `ksk_` API keys both resolve their profile before the lookup. A failed lookup throws, so OMP keeps serving the last good report instead of an empty one. Pi registration is unchanged.
+  OMP's table compacts amounts (`2K / 10K credits`) and shows the reset only as a relative duration, so each limit also carries a note line with the exact figures and absolute reset time: `Used 1,990.15 · Left 8,009.85 · Total 10,000 credits · Resets 2026-11-01, 07:00 GMT+7`.
+
+### Fixed
+
+- Load and discover Kiro models under [Oh My Pi](https://github.com/can1357/oh-my-pi) (OMP) without changing Pi behavior.
+  On OMP the provider uses the host's native model discovery and keeps the logged-in OAuth region and profile.
+  `KIRO_API_KEY` works on OMP, with `OMP_KIRO_PROVIDER_KEY` accepted as a fallback name; with neither set, OAuth is used.
+  Kiro HTTP errors now report their status in `errorStatus`, so OMP no longer ends a failed turn without an error.
+  OMP git installs load the TypeScript source directly, since Bun skips the build step.
+- Normalize the SSO region's case before mapping it to a Kiro API region. A region typed at the IAM Identity Center prompt was persisted verbatim, so `Ap-southeast-1` missed `API_REGION_MAP` and every management call went to the nonexistent `management.Ap-southeast-1.kiro.dev`, failing each turn with `Kiro management ListAvailableProfiles request failed in Ap-southeast-1`. `resolveApiRegion` now trims and lowercases its input, and the login prompt lowercases the region before starting the device flow.
+- Retry a Kiro management request once when it fails before any HTTP response (socket reset, stale pooled connection, DNS blip), and name the transport reason in the error. Profile discovery runs before every runtime request, so a single dropped connection ended the whole turn with an opaque `Kiro management ListAvailableProfiles request failed in <region>` — the underlying cause lived only in `Error.cause`, which hosts do not display. The retry covers `ListAvailableProfiles`, `ListAvailableModels`, `GetProfile` and `GetUsageLimits`; HTTP errors are not retried here. When the primary region answers 403 and the fallback region is then unreachable, the 403 is rethrown so the credential-refresh path ([#107](https://github.com/mikeyobrien/pi-provider-kiro/pull/107)) still runs instead of failing on the fallback's transport error.
+- Stop corrupting kiro-cli's IAM Identity Center session on refresh write-back. `saveKiroCliCredentials` wrote any refreshed IDC token into `kirocli:odic:token`, but kiro-cli pairs that slot with its own `kirocli:odic:device-registration` client. A token from a pi login that registered its own client became an unrefreshable pair: it worked for the hour its access token lived, then every refresh got `400 invalid_grant` and the host reported "No API key found for kiro". The write-back now skips a slot whose registered client did not issue the token.
+- Token-endpoint refresh failures now carry the OAuth `error` code (`Token refresh failed: 400 invalid_grant`) instead of the bare status. Hosts classify a refresh failure as permanent by that code; without it a revoked or mismatched refresh token looked transient and was retried forever instead of being retired.
+
+### Developer
+
+- Tests no longer inherit a developer's `KIRO_PROFILE_ARN`, which overrode every mocked profile lookup.
+
+## [0.12.1] - 2026-09-24
+
+### Fixed
+
+- Route IAM Identity Center sessions from `sa-east-1` to Kiro's `us-east-1` API region, avoiding catalog refresh requests to the unsupported `management.sa-east-1.kiro.dev` endpoint ([#128](https://github.com/mikeyobrien/pi-provider-kiro/pull/128)).
+
+## [0.12.0] - 2026-09-22
+
+### Added
+
+- Opt-in Kiro usage footer indicator. Set `pi-provider-kiro.showUsageInFooter` to `true` to show a compact badge of the percent of Kiro allowance used (e.g. `◆ Kiro 1%`) while a Kiro model is active, colored by consumption (comfortable below 70%, warning at 70%, critical at 90%). It refreshes on session start, model switches, and after completed Kiro turns, throttled by a cooldown, and fails silently — hidden for non-Kiro models, when no credential resolves, or on any usage-lookup failure. Resolves the credential pi persists in `~/.pi/agent/auth.json` so the footer works even without a local kiro-cli/IDE credential, and exposes numeric `used`/`limit` on usage buckets so consumers can compute a percentage without parsing display strings. Disabled by default ([#165](https://github.com/mikeyobrien/pi-provider-kiro/pull/165)).
+
+### Fixed
+
+- Clear the first-token timeout timer once the race is decided. The losing `setTimeout` of the first-token `Promise.race` was never cleared, so every completed request kept a ref'd 90 s timer pending that held the Node event loop open — `pi -p` and SDK embeds sat idle for up to 90 s after the answer printed ([#154](https://github.com/mikeyobrien/pi-provider-kiro/issues/154)).
+- Keep version dots in generated display names for catalog models missing from the bootstrap list. The name was derived from the pi ID, where `toPiModelId` had already rewritten `5.1` as `5-1`, so `claude-fable-5.1` rendered as "Claude Fable 5 1"; it now reads "Claude Fable 5.1".
+- Send the runtime request to the region that owns the resolved profile instead of the SSO-derived region. `ListAvailableProfiles` already probes across regions ([#104](https://github.com/mikeyobrien/pi-provider-kiro/issues/104), [#131](https://github.com/mikeyobrien/pi-provider-kiro/issues/131)), so an IAM Identity Center instance in `us-east-1` resolves a profile in `eu-central-1` and model discovery succeeds — but the runtime host was still built from the login region, and Kiro answers a cross-region profile ARN with a generic `400 {"message":"Improperly formed request."}` that fails every model on every request. The runtime endpoint and the background catalog refresh now follow the profile ARN's own region, including when a credential refresh swaps in a profile from another region mid-request.
+
+## [0.11.0] - 2026-09-15
+
+### Added
+
+- Opt-in Kiro usage estimates for Pi dashboards ([#157](https://github.com/mikeyobrien/pi-provider-kiro/pull/157)). `usageTracking.estimateDollarValue` converts the final successful attempt's credit count to an estimated USD-equivalent total, using the published `$0.04` add-on-credit rate by default or an optional `usdPerCredit` override. `usageTracking.estimateCacheUsage` conservatively reclassifies prompt tokens repeated from the previous successful turn in the same session as cache reads, marks the usage with `cacheEstimated`, resets after configurable idle expiry or large context reduction, and always defers to real wire cache counters. `estimatedCacheTimeout` defaults to five minutes and accepts `0` to disable expiry. Legacy `usageTracking.enabled` remains accepted as a deprecated alias for `estimateDollarValue`. Both estimators are disabled by default and fail closed on invalid settings. These are estimates, not invoices: subscription-included credits may have no marginal cost, and estimated cache usage does not prove a backend cache hit.
+- Typed `KiroApiError` with `status`, `reasonCode`, `retryAfterMs`, and `providerAttempts`, exported from the entry point ([#111](https://github.com/mikeyobrien/pi-provider-kiro/pull/111)). Runtime failures no longer throw a flat `Error` whose classification had to be recovered from prose.
+- Scan local Kiro credentials at startup (and when the host `refreshModels` hook has no credential) so catalog discovery can run without the host passing credentials: `KIRO_API_KEY`, then kiro-cli social, then kiro-cli, then Kiro IDE ([#147](https://github.com/mikeyobrien/pi-provider-kiro/pull/147)). The factory stays synchronous; discovery is fire-and-forget after `registerProvider`.
+
+### Changed
+
+- Write the catalog cache to `~/.pi/agent/kiro-management-models-cache.json`, still reading the legacy `~/.kiro-management-models-cache.json` path ([#149](https://github.com/mikeyobrien/pi-provider-kiro/pull/149)).
+
+### Fixed
+
+- Resolve `ksk_` API key profiles through GetProfile instead of ListAvailableProfiles, which returns 403 Unsupported token type. Catalog queries then use that ARN in us-east-1. `KIRO_PROFILE_ARN` still wins ([#147](https://github.com/mikeyobrien/pi-provider-kiro/pull/147)).
+- Preserve canonical `developer` messages emitted by newer Pi-compatible hosts by lowering them to Kiro user input. Agent reminders and advisories previously degraded to the neutral `"Please proceed with the task."` placeholder when current, and disappeared from historical context entirely ([#151](https://github.com/mikeyobrien/pi-provider-kiro/pull/151)).
+- Cancel the response body read when the caller abort signal fires mid-stream, so Esc/interrupt no longer waits for the server to finish generating ([#153](https://github.com/mikeyobrien/pi-provider-kiro/pull/153)).
+- Map IAM Identity Center region `ap-northeast-2` to Kiro API region `us-east-1`, so Korean-region SSO credentials can reach management and runtime endpoints ([#133](https://github.com/mikeyobrien/pi-provider-kiro/pull/133)).
+- Route Kiro stream events by the modeled `:event-type` key instead of field sniffing ([#113](https://github.com/mikeyobrien/pi-provider-kiro/pull/113)). `metadataEvent` token usage is no longer dropped, `meteringEvent` credit counts are no longer misread as tokens, and exception-framed errors keep their modeled class. Cache read/write counters, split metadata frames, and wire `totalTokens` are recorded; usage is scoped to one retry attempt so a discarded attempt cannot bill the turn that replaced it.
+- Report a turn that silently produced less than the model sent ([#119](https://github.com/mikeyobrien/pi-provider-kiro/pull/119)). `streamKiro` now sets `AssistantMessage.errorMessage` when the empty-response or echo-loop retry budget is exhausted, and when a tool call is dropped because its arguments would not parse — the last of which is unrecoverable downstream, since the call is gone before the message is persisted. Dropped-call tool names use a terminal-safe A–P encoding in the diagnostic: complete sets that fit preserve every JavaScript UTF-16 code unit, while oversized sets become one fixed-size SHA-256 fingerprint rather than a misleading partial identity. Thus a model-chosen name such as `set_timeout` or `http500_probe` cannot make a terminal failure match a consumer's retry filter and disappear again. No `stopReason` changes: the value stays inside pi-ai's existing union, and the exhaustion warning now reports the reason actually assigned instead of promising `"stop"`. The diagnostics are deliberately worded as terminal so a consumer's retryable-error classifier cannot mistake them for a transient transport failure. Note the consequence for hosts that fail a run on any non-retryable trailing `errorMessage` without checking `stopReason`: a silent turn that previously completed quietly now surfaces as a failure. That is the point of the change, but it is a visible behaviour change, not only added observability. Hosts that cannot be reached by this field are unaffected: pi-ai's `isRetryableAssistantError` requires `stopReason === "error"`, and of `isContextOverflow`'s three branches only the first reads `errorMessage` behind that same gate — its silent-overflow and length-stop branches judge `usage` alone.
+
+## [0.10.2] - 2026-08-31
+
+### Added
+
+- Support kiro-cli external IdP credentials, so a kiro-cli session authenticated through an external identity provider can be reused by the provider instead of forcing a separate login ([#134](https://github.com/mikeyobrien/pi-provider-kiro/pull/134)).
+- OAuth rework: interactive login, API key support, and PKCE social login ([#135](https://github.com/mikeyobrien/pi-provider-kiro/pull/135)).
+- Keep the newest bounded image in history so follow-ups like "look at that image again" still resolve. The newest image-bearing turn is retained when its payload fits 512KB of base64; older turns are still stripped, and an oversized newest set is dropped rather than substituting an older image. Retention is conditional on the model actually accepting images, and `gpt-5.6-luna`'s vision capability is now mapped correctly with stale cache entries corrected on read ([#138](https://github.com/mikeyobrien/pi-provider-kiro/pull/138)).
+- Export Kiro's reason-code vocabulary as a frozen `KIRO_REASON_CODES` record and re-export the `isTooBigError` / `isNonRetryableBodyError` / `isCapacityError` classification predicates from the entry point, so consumers stop hardcoding drifting copies of the same service strings ([#115](https://github.com/mikeyobrien/pi-provider-kiro/pull/115)). The same change makes the published entry point actually resolvable and loadable: `main`/`types` are declared, declarations are emitted, the esbuild bundle gains the `createRequire` banner its bundled CJS graph needs, and the pi host packages are declared as optional peerDependencies. `test/packaging.test.ts` pins the whole contract.
+- The entry module now re-exports `KiroManagementHttpError` ([#144](https://github.com/mikeyobrien/pi-provider-kiro/pull/144)). The class already shipped in 0.10.0 and is thrown by every management-plane request that returns a non-OK status (profile discovery, model catalog, usage limits) and already caught in `stream.ts`, where a 403 drives the credential-refresh retry — but it was not re-exported from `src/index.ts`, and there is no per-module file to deep-import instead: the build bundles the whole graph into one `dist/index.js`. No behaviour change: the class, its `status` field, and every throw and catch site are unchanged. Same entry-point caveat as the 0.10.0 re-exports — this is the extension entry the pi host loads, not a resolvable npm entry point.
+
+### Fixed
+
+- Normalize cross-provider tool-call IDs before sending them to Kiro. OpenAI Responses persists compound IDs such as `call_…|fc_…` that exceed Kiro's 64-character limit and contain an unsupported pipe, which previously wedged a session with `400 REQUEST_BODY_INVALID` after switching models. Native Kiro IDs remain unchanged, while remapped tool uses and results retain the same deterministic ID ([#137](https://github.com/mikeyobrien/pi-provider-kiro/pull/137)).
+- Profile discovery now continues probing the remaining canonical management regions after a regional 403 on ListAvailableProfiles, instead of aborting on the primary region. A region-mismatched token whose profile lives in another canonical region (e.g. us-east-1 token, eu-central-1 profile) previously surfacing `ListAvailableProfiles failed in <region>: 403 Forbidden` now resolves correctly ([#131](https://github.com/mikeyobrien/pi-provider-kiro/issues/131)). A 403 on every region is still rethrown so credential refresh/retry paths (#107) engage for genuine auth failures.
+- Refresh credentials from the credential's own auth family. The refresh cascade previously handed an IdC session a social account's token (a different identity with a different profile ARN) and returned always-IdC Kiro IDE credentials for social sessions; every source lookup is now filtered by the credential's derived auth family ([#142](https://github.com/mikeyobrien/pi-provider-kiro/pull/142)).
+- Bound Kiro response header waits and coordinate request throttles, so a stalled response no longer hangs a turn indefinitely ([#136](https://github.com/mikeyobrien/pi-provider-kiro/pull/136)).
+
+## [0.10.1] - 2026-08-24
+
+### Fixed
+
+- Carry the profile ARN through the IDC kiro-cli token path and add a `KIRO_PROFILE_ARN` environment override with highest precedence, so users with multiple Kiro profiles can pin the one they want instead of silently getting the first profile's reduced model catalog ([#110](https://github.com/mikeyobrien/pi-provider-kiro/issues/110)). Every profile resolution source (env / provided / network) is debug-logged as `profile.resolve`.
+- Recover tool calls emitted as XML-dialect markup in assistant text for models that fall back to that dialect, instead of surfacing the markup as visible text ([#125](https://github.com/mikeyobrien/pi-provider-kiro/pull/125)).
+- Stop logging capacity retries to stderr; retry accounting still happens, the console noise does not ([#116](https://github.com/mikeyobrien/pi-provider-kiro/pull/116)).
+- Resolve a missing Kiro profile when the SSO-derived API region is wrong ([#104](https://github.com/mikeyobrien/pi-provider-kiro/issues/104)). `ListAvailableProfiles` is regional to where the profile actually lives, not to the login region, so a token whose profile is in `us-east-1` while the SSO region maps to `eu-central-1` returned `{ profiles: [] }` and the provider gave up. Profile resolution now probes both `us-east-1` and `eu-central-1` when the primary region comes back empty, caches the result, and routes `ListAvailableModels` to the region where the profile was found. The failure message now lists every attempted region and directs the user to `kiro-cli whoami` when the profile cannot be reached in any canonical region.
+- Preserve every literal `<thinking>`, ` thinking`, `<reasoning>`, or `<thought>` region in one streamed response as its own thinking block instead of leaking every region after the first into visible assistant text.
+- Keep parsed thinking blocks in the order the wire delivered them instead of splicing them ahead of text already emitted. The parser moved a thinking block into the index of an existing text block to make the content array read thinking → text, which made the persisted array contradict the stream and reused one `contentIndex` for two different blocks — an index-addressed consumer such as pi-mono's proxy transport overwrote the text it had already placed and then threw on the following `text_end`. Empty tagged regions are still materialized. Presentation order is unaffected: outbound history still prepends every thinking block, and renderers drive thinking from stream events.
+
+## [0.10.0] - 2026-08-16
+
+### Fixed
+
+- Stop flattening reasoning into the assistant text channel. `buildHistory` prepended `<thinking>…</thinking>` onto `assistantResponseMessage.content`, writing literal markup into the string the model reads back as its own prior speech — a dialect this provider invented outbound and then parsed back out again inbound in `thinking-parser.ts`. First-party Kiro Agent's `extractTextContent` type-filters to `text` blocks, so it never emits that markup. Structured `toolUses` are untouched. A turn whose only block was reasoning is now retained with `content: ""` rather than dropped: dropping it would collapse the surrounding user turns together and break `ALTERNATING_MESSAGES`. Residual divergence, stated rather than implied — first-party does not discard reasoning, it carries it in a typed `assistantResponseMessage.reasoningContent` field; this change reaches parity on the text channel only. Both flatten sites are covered: `buildHistory` for history turns, and the current-message assistant branch in `stream.ts`, which pushes its own `armContent` into the same `assistantResponseMessage.content` and so reaches the wire identically. The current-turn site needs no reasoning-only guard — `currentMsgStartIdx` increments past an assistant that declares no `toolCall`, so reaching that branch means one exists and the entry cannot be dropped for having empty content.
+- Repair malformed tool structure before sending instead of only warning about it. Observed 2026-08-14: two concurrent tool executions interleaved into one transcript produced `assistant(toolUses=[A]) / user(text) / assistant(toolUses=[B]) / user(toolResults=[A])`, Kiro answered `400 … tool_use ids were found without tool_result blocks immediately after: <B>`, and because the retry resent byte-identical history the session was terminally wedged. `prepareHistory` could not see it — `sanitizeHistory` tests tool pairing by position, not by id, and `injectSyntheticToolCalls` only rescues orphaned results — so `streamKiro` now runs `repairKiroConversation` on the whole conversation (history plus the current message) and sends the repaired bytes. Two limits are deliberate and pinned by tests: a result displaced from its issuing tool use is discarded rather than relocated, because preserving it would require either reordering conversation chronology or putting the same `toolUseId` on the wire twice, neither of which is probed; and `ALTERNATING_MESSAGES` is not repaired, because this provider documents that the API accepts non-alternating history. The warning now describes what survived repair rather than what the input contained.
+- Relocate a displaced tool result rather than discarding it, superseding the first of the two limits above. `relocateDisplacedToolResults` moves each result to sit immediately after the assistant turn that issued its call, matched by id, applied before anything positional runs. It is a pure reorder: nothing is fabricated, nothing is dropped, a result whose call appears nowhere is left in place for `injectSyntheticToolCalls`, and a well-formed transcript is returned unchanged. On the interleaved shape above, `A`'s real output now reaches the wire paired with `A` where it was previously stripped, and `B` is still answered synthetically — relocation changes which output is preserved, not how much is fabricated. It also supersedes the second limit for this shape: with the result moved behind its call the interjection merges into that carrier entry rather than following it, so one user entry carries both `A`'s real result and the user's verbatim text and all seven rules pass. Two costs, both pinned: wire chronology shifts, because the interjection was said before `A`'s result arrived but appears after it; and the same change closes a latent defect it exposed — `buildHistory`'s user-merge branch joined with an unconditional `\n\n`, which was harmless while carriers held prose but sent `"\n\ncontinue"` for a user who typed `continue` once carriers hold `content: ""`. Only non-empty sides are joined now.
+- Stop injecting `"Tool results provided."` into tool-result turns. A tool turn's payload is `userInputMessageContext.toolResults`; Kiro's requirement is content **or** tool results, so its `content` is now empty. Previously every tool turn shipped that sentence as a user utterance — and the merge path appended it onto the text of a message the user had actually written. Wire-probed against `runtime.us-east-1.kiro.dev` with `origin: "KIRO_CLI"`: `content: ""` plus populated `toolResults` returns HTTP 200. Matches first-party Kiro Agent, which ships `content: ''` on synthesized and consolidated tool turns.
+- Send a placeholder instead of an empty `content` when a turn carries no text, and stop reporting Kiro's generic "Improperly formed request." rejection as a context overflow. A host that appends a message whose role falls outside pi-ai's `Message` union produced `content: ""`, which Kiro rejects with `400 REQUEST_BODY_INVALID`; relabeling that as `context_length_exceeded` then drove the caller into a compaction loop against a request that was structurally invalid rather than oversized. Also covers image-only and empty-text user messages. That fallback is now scoped to turns with no tool results, so it cannot refill a tool turn.
+
+### Added
+
+- `src/history-validator.ts` (F11): the seven conversation invariants first-party Kiro Agent enforces, ported to this provider's request shape — `STARTS_WITH_USER_MESSAGE`, `ENDS_WITH_USER_MESSAGE`, `ALTERNATING_MESSAGES`, `TOOL_USES_AND_RESULTS`, `TOOL_RESULTS_AND_NO_USES`, `TOOL_RESULTS_ORPHAN_IDS`, `NON_EMPTY_USER_MESSAGE`. Re-exported from the extension entry module (`src/index.ts` → `dist/index.js`) as `validateKiroConversation`, `validateKiroToolStructure`, `repairKiroConversation`, `kiroConversationEntries`, `KiroValidationRule`, `KIRO_VALIDATION_MESSAGES`, `KIRO_TOOL_STRUCTURE_RULES`, `isKiroToolStructureRule`, and `SYNTHETIC_FAILED_TOOL_RESULT_TEXT`. Note that this is the extension entry, not a resolvable npm entry point: `package.json` declares no `main`, `exports`, or `types` and the build emits no declarations, so a bare `import { validateKiroConversation } from "pi-provider-kiro"` does not resolve from the published tarball. Making that surface a public API is a packaging change and is deliberately out of scope here. `streamKiro` repairs the conversation before sending and warns about any violation that survives repair; it does not throw, because failing closed would change behavior for callers whose histories send today. The `TOOL_RESULTS_AND_NO_USES` check also covers a tool-result carrier with no assistant predecessor at all — kiro-agent's sanitizer drops that shape before validating, but this provider can send one as the current message, where `prepareHistory` cannot reach it.
+- The entry module also re-exports `EMPTY_CONTENT_PLACEHOLDER` and the `KiroHistoryEntry` / `KiroUserInputMessage` / `KiroToolResult` / `KiroToolUse` types, under the same entry-point caveat as above.
+
+## [0.9.3] - 2026-07-24
+
+### Fixed
+
+- Restore `max` as a distinct thinking level instead of aliasing it to the highest catalog-listed effort ([#99](https://github.com/mikeyobrien/pi-provider-kiro/pull/99)).
+
+## [0.9.2] - 2026-07-22
+
+### Fixed
+
+- Restore visible summarized thinking for Claude Sonnet 5, Opus 4.8, and other adaptive-thinking models by requesting and parsing Kiro's native thinking stream events ([#97](https://github.com/mikeyobrien/pi-provider-kiro/pull/97)).
+
+## [0.9.1] - 2026-07-22
+
+### Fixed
+
+- Restore user-visible Claude thinking output after the Kiro runtime migration by retaining structured adaptive effort while also sending the thinking markers required by the runtime ([#95](https://github.com/mikeyobrien/pi-provider-kiro/pull/95)).
+
+## [0.9.0] - 2026-07-20
+
+### Added
+
+- Claude Sonnet 5 and Claude Fable 5 models ([#87](https://github.com/mikeyobrien/pi-provider-kiro/pull/87), [#83](https://github.com/mikeyobrien/pi-provider-kiro/pull/83)).
+- Schema-driven reasoning effort, model token limits, and region-keyed catalog caching.
+
+### Changed
+
+- Migrated model discovery and inference to Kiro's management and runtime services, matching the current kiro-cli and kiro-agent REST protocols ([#91](https://github.com/mikeyobrien/pi-provider-kiro/pull/91)).
+
+### Fixed
+
+- Map pi's highest supported reasoning level to Kiro `max` for models whose catalog omits `xhigh`.
+
+## [0.8.0] - 2026-05-29
+
+### Added
+
+- Claude Opus 4.8 model ([#78](https://github.com/mikeyobrien/pi-provider-kiro/pull/78))
+
+## [0.7.0] - 2026-05-26
+
+### Added
+
+- Fully dynamic model list loading and caching using Kiro's `/ListAvailableModels` API, which completely replaces hardcoding-staleness and dynamically adds any new models Kiro registers (resolves [#69](https://github.com/mikeyobrien/pi-provider-kiro/issues/69)).
+- Add `"pi-package"` keyword to `package.json` for discoverability on https://pi.dev/packages (resolves [#61](https://github.com/mikeyobrien/pi-provider-kiro/issues/61)).
+
+### Changed
+
+- Migrated all dependencies and imports from the deprecated `@mariozechner/` package scope to the new `@earendil-works/` package scope (`pi-ai`, `pi-coding-agent`, `pi-tui`), upgrading them to version `^0.75.5`.
+- Updated build script to use `esbuild` direct compilation on source TypeScript files, improving speed and removing dual-step `tsc` builds.
+
+### Fixed
+
+- Fixed Google/GitHub social login issues by checking and injecting `profileArn` directly from `kiro-cli` configuration when AWS returns empty lists (merged PR [#70](https://github.com/mikeyobrien/pi-provider-kiro/pull/70)).
+- Fixed production Git installation issues (`pi install git:...`) by moving `esbuild` to production dependencies and aligning the `prepare` lifecycle hook (merged PR [#68](https://github.com/mikeyobrien/pi-provider-kiro/pull/68)).
+- Removed `glm-5` from the `eu-central-1` set since it is only supported in `us-east-1` (resolves [#66](https://github.com/mikeyobrien/pi-provider-kiro/issues/66)).
+- Expose `xhigh` thinking level in pi UI for all reasoning models by declaring `thinkingLevelMap` metadata.
+
+## [0.6.1] - 2026-04-18
+
+### Added
+
+- `KIRO_DEBUG` env var for structured debug logging of requests, stream events, and responses with redacted auth tokens ([#57](https://github.com/mikeyobrien/pi-provider-kiro/pull/57))
+
+### Fixed
+
+- Recover from expired kiro-cli tokens on 403 by falling back to `refreshViaKiroCli()` instead of silently reusing the stale access token ([#57](https://github.com/mikeyobrien/pi-provider-kiro/pull/57))
+
+## [0.6.0] - 2026-04-18
+
+### Added
+
+- Claude Opus 4.7 model ([#54](https://github.com/mikeyobrien/pi-provider-kiro/pull/54))
+
+### Fixed
+
+- Accurate output token counting for tool-call turns ([#53](https://github.com/mikeyobrien/pi-provider-kiro/pull/53))
+- Eliminate echo loop caused by synthetic history padding ([#51](https://github.com/mikeyobrien/pi-provider-kiro/pull/51))
+
+## [0.5.2] - 2026-04-16
+
+### Fixed
+
+- Exclude `@earendil-works/pi-tui` from the release bundle so `npm ci` / CI builds stop trying to inline `koffi` native binaries during `prepare`
+
+### Changed
+
+- Refresh README and package metadata to match the current 19-model surface and login flow
+
+## [0.5.1] - 2026-04-14
+
+### Fixed
+
+- Recover npm publishing after the failed `v0.5.0` release by shipping the Node 24 publish workflow update already merged on `main`
+
+## [0.5.0] - 2026-04-07
+
+### Added
+
+- MiniMax M2.5 model
+- Kiro IDE token as auth fallback when kiro-cli is unavailable
+- Use pi `sessionId` for Kiro `conversationId`
+
+### Fixed
+
+- Add `profileArn` to `generateAssistantResponse` requests ([#28](https://github.com/mikeyobrien/pi-provider-kiro/issues/28))
+- Scale `HISTORY_LIMIT` dynamically to model context window ([#30](https://github.com/mikeyobrien/pi-provider-kiro/issues/30))
+- `sanitizeHistory` strips leading invalid entries instead of returning `[]`
+
+## [0.4.2] - 2026-03-20
+
+### Fixed
+
+- Preserve non-Kiro provider models when applying region-based Kiro model filtering in `modifyModels()`
+
+## [0.4.1] - 2026-03-19
+
+### Changed
+
+- Delegate generic HTTP `429` / `5xx` retry behavior to `pi-coding-agent` instead of retrying them inside the provider
+
+### Fixed
+
+- Prevent `pi-coding-agent` outer auto-retry from misclassifying Kiro `MONTHLY_REQUEST_COUNT` and `INSUFFICIENT_MODEL_CAPACITY` errors as generic retryable `429`s
+
+## [0.4.0] - 2026-03-15
+
+### Added
+
+- Google and GitHub social login support via kiro-cli delegation
+- `getKiroCliSocialToken()` to prefer social credentials when available
+- OAuth name updated to "Kiro (Builder ID / Google / GitHub)" to reflect all auth methods
+
+### Changed
+
+- `loginKiro()` now prefers social tokens from kiro-cli if available
+- `refreshKiroToken()` checks social tokens first to respect user's chosen login method
+- Social login requires kiro-cli to be installed (delegates browser/PKCE flow)
+
+### Fixed
+
+- Pass through raw `contextUsagePercentage` as `usage.contextPercent` so UIs display accurate context usage instead of back-calculating from input tokens (which the usage event can overwrite with raw counts exceeding the context window)
+
+## [0.3.0] - 2026-03-05
+
+### Added
+
+- Cap system prompt at 4096 tokens before sending to Kiro API
+- Model-aware history byte budget derived from context window (70% × 4 bytes/token)
+- `MONTHLY_REQUEST_COUNT` and `INSUFFICIENT_MODEL_CAPACITY` as non-retryable error patterns (kiro-cli parity)
+- Abortable retry delays — abort signal cancels in-progress backoff waits
+- Expired kiro-cli credential fallback in OAuth refresh cascade
+
+### Changed
+
+- Lower max retry backoff from 30s to 10s
+- Increase idle timeout from 120s to 300s to match kiro-cli behavior
+- Read snake_case device registration credentials from kiro-cli
+
+### Fixed
+
+- Drop empty assistant messages from history sanitization
+- Handle error events mid-stream and reset idle timer on meaningful events
+- Refresh token from kiro-cli on 403 before retrying
+
+## [0.2.2] - 2026-02-26
+
+### Added
+
+- 4-layer auth refresh with kiro-cli sync: IDC token refresh, desktop token refresh, kiro-cli DB sync, and OAuth device code flow fallback
+
+### Fixed
+
+- Skip malformed tool calls instead of crashing; retry on idle timeout
+- Biome formatting in event-parser test
+
+## [0.2.1] - 2026-02-26
+
+### Added
+
+- Desktop auth method with region-aware token refresh via `prod.{region}.auth.desktop.kiro.dev`
+- Error handling, retry logic (up to 3 retries with 0.7x reduction factor on 413), and history truncation
+
+### Fixed
+
+- Response validation, error tests, template syntax, and stream safety net
+
+## [0.1.1] - 2026-02-19
+
+### Added
+
+- Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
+
+[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/vnlebaoduy/pi-kiro-connect/releases/tag/v0.13.0
+[0.12.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.2...v0.11.0
+[0.10.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.1...v0.10.2
+[0.10.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.3...v0.10.0
+[0.9.3]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.2...v0.9.3
+[0.9.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.8.1...v0.9.0
+[0.8.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.5.1...v0.5.2
+[0.4.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.4.0...v0.4.1
+[0.5.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.4.5...v0.5.0
+[0.4.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.3.2...v0.4.0
+[0.3.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.1.1...v0.2.1
+[0.1.1]: https://github.com/mikeyobrien/pi-provider-kiro/releases/tag/v0.1.1

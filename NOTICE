@@ -1,0 +1,13 @@
+pi-kiro-connect
+https://github.com/vnlebaoduy/pi-kiro-connect
+
+This project is a fork of pi-provider-kiro by Mikey O'Brien and contributors:
+https://github.com/mikeyobrien/pi-provider-kiro
+
+Forked from upstream commit bb89d39 ("fix: respect model opt-out for text tool
+recovery (#175)"), which pi-provider-kiro distributes under the MIT License.
+The upstream commit history is not carried in this repository; it remains
+available in the upstream repository above.
+
+Kiro, AWS, Amazon CodeWhisperer and Amazon Q are trademarks of Amazon.com, Inc.
+or its affiliates. This project is not affiliated with or endorsed by Amazon.

@@ -1,0 +1,99 @@
+name: Release
+
+# Push a `vX.Y.Z` tag on main. This workflow verifies it, then publishes:
+#   - `release/vX.Y.Z`: the same tree plus the built `dist/`, which is what
+#     `pi install git:…@release/vX.Y.Z` clones (pi runs `dist/index.js` and git
+#     installs never run the build).
+#   - A GitHub Release with the npm tarball and the install script attached.
+#   - npm, only when the repository variable NPM_PUBLISH is "true".
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Tag matches package.json
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version}"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+      - name: Push built release ref
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --create "release/${GITHUB_REF_NAME}"
+          git add --force dist
+          git commit --quiet --message "build: ${GITHUB_REF_NAME} with dist"
+          git push --force origin "release/${GITHUB_REF_NAME}"
+
+      - name: Pack
+        id: pack
+        run: echo "tarball=$(npm pack --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+          cat >> notes.md <<EOF
+
+          ## Install
+
+          **Oh My Pi**
+          \`\`\`bash
+          omp plugin install github:${GITHUB_REPOSITORY}#${GITHUB_REF_NAME}
+          \`\`\`
+
+          **pi**
+          \`\`\`bash
+          pi install git:github.com/${GITHUB_REPOSITORY}@release/${GITHUB_REF_NAME}
+          \`\`\`
+
+          **Both, via the installer**
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/scripts/install.sh | bash -s -- --version ${GITHUB_REF_NAME}
+          \`\`\`
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            --verify-tag \
+            "${{ steps.pack.outputs.tarball }}" \
+            scripts/install.sh
+
+      - name: Publish to npm
+        if: vars.NPM_PUBLISH == 'true'
+        run: npm publish --provenance --access public

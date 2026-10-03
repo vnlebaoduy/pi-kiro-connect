@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "declaration": true,
+    // Off deliberately: `files` publishes `dist` only, so declaration maps would
+    // point at `../src/*.ts` paths absent from the tarball — dead maps that
+    // break go-to-definition for consumers instead of helping it.
+    "declarationMap": false,
+    "sourceMap": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "test"]
+}
