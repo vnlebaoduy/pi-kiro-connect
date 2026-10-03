@@ -20,7 +20,7 @@ The installer installs the latest release into every host it finds on `PATH` and
 
 | Flag | Effect |
 |---|---|
-| `--version v0.13.0` | Install a specific release |
+| `--version v0.13.1` | Install a specific release |
 | `--pi` / `--omp` | Install into one host only |
 | `--uninstall` | Remove pi-kiro-connect |
 
@@ -34,7 +34,7 @@ less install.sh && bash install.sh
 ### Oh My Pi
 
 ```bash
-omp plugin install github:vnlebaoduy/pi-kiro-connect#v0.13.0
+omp plugin install github:vnlebaoduy/pi-kiro-connect#v0.13.1
 ```
 
 omp installs with Bun and loads `src/index.ts` directly, so it needs no build step. To update, run the same command with a newer tag.
@@ -42,7 +42,7 @@ omp installs with Bun and loads `src/index.ts` directly, so it needs no build st
 ### pi
 
 ```bash
-pi install git:github.com/vnlebaoduy/pi-kiro-connect@release/v0.13.0
+pi install git:github.com/vnlebaoduy/pi-kiro-connect@release/v0.13.1
 ```
 
 A git install in pi only runs `npm install` and never the build, while pi loads `dist/index.js`. For that reason every release publishes a `release/vX.Y.Z` branch that is the tag plus the prebuilt `dist/`. Always pin pi to one of those branches, not to the plain tag or to `main`.

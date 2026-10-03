@@ -76,6 +76,16 @@ describe("published package surface", () => {
     expect(pkg.scripts.build).toContain("tsc --emitDeclarationOnly");
   });
 
+  // pi git installs run `npm install --omit=dev` in the clone, which runs these
+  // lifecycle scripts — without the devDependencies a build needs. Any of them
+  // calling the build fails the whole install with exit 127. The prebuilt
+  // `dist/` on the `release/vX.Y.Z` branch is what pi loads instead.
+  it("runs no build while the package itself is installed", () => {
+    for (const hook of ["preinstall", "install", "postinstall", "prepare"]) {
+      expect(pkg.scripts, `${hook} would run during a pi git install`).not.toHaveProperty(hook);
+    }
+  });
+
   // Bundled CJS dependencies call `require("buffer")` — the @smithy/core
   // event-stream marshaller `stream.ts` uses reaches it through util-utf8. In an
   // ESM bundle esbuild's `__require` shim throws for those unless a real

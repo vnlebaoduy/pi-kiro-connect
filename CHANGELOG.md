@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-10-03
+
+### Fixed
+
+- `pi install git:github.com/vnlebaoduy/pi-kiro-connect@release/v0.13.0` failed with `npm install … failed with code 127`. pi git installs run `npm install --omit=dev`, which also runs the `prepare` script; `prepare` ran the build, and the build tools are devDependencies. `prepare` is removed, because the `release/vX.Y.Z` branch already carries the prebuilt `dist/`. omp installs were unaffected.
+
 ## [0.13.0] - 2026-10-03
 
 First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://github.com/mikeyobrien/pi-provider-kiro) 0.12.1 at upstream commit `bb89d39`. Sections below 0.13.0 are the upstream history; their links point to the upstream repository.
@@ -317,7 +323,8 @@ First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://git
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/vnlebaoduy/pi-kiro-connect/releases/tag/v0.13.0
 [0.12.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.11.0...v0.12.0
