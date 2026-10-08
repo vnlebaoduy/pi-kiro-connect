@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-07
+
+### Added
+
+- Kiro OAuth credentials now carry the account they belong to (`accountId`, plus `email` when Kiro reports one). Kiro access tokens are opaque, so a host could not decode an identity from them the way it does for Codex or Anthropic. Every Kiro credential was therefore stored with no identity: omp reported it as `(unknown oauth account)`, could not tell two Kiro accounts apart when rotating, and saved each repeated `/login` of the same account as a new row instead of updating the existing one. Login and refresh now ask Kiro's management plane (`GetUsageLimits`) for the signed-in user. A refresh that keeps the same session keeps the identity it already has without a lookup. A refresh that changes session (for example, after `kiro-cli login` switched user) looks it up again, so a credential is never labelled with a previous account. A failed lookup never fails the login or refresh.
+- The stream calls the host's `onPayload` and `onResponse` hooks, so extensions using omp's `before_provider_request` / `after_provider_response` (or pi's equivalents) now see Kiro requests. `onPayload` may replace the request body and runs on every attempt, because each retry rebuilds the body.
+
 ## [0.13.2] - 2026-10-03
 
 ### Changed
@@ -329,7 +336,8 @@ First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://git
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/vnlebaoduy/pi-kiro-connect/releases/tag/v0.13.0

@@ -8,6 +8,7 @@
 // to the interactive login flow in login.ts (Feature 10).
 
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import { withKiroAccountIdentity } from "./account-identity.js";
 import { formatSafeError } from "./debug.js";
 import { resolveApiRegion } from "./endpoints.js";
 import { getKiroIdeCredentials, getKiroIdeCredentialsAllowExpired } from "./kiro-ide.js";
@@ -34,6 +35,9 @@ export interface KiroCredentials extends OAuthCredentials {
   profileArn?: string;
   startUrl?: string;
   isEnterprise?: boolean;
+  /** Kiro account behind this credential; hosts key multi-account rotation and login dedupe on it. */
+  accountId?: string;
+  email?: string;
 }
 
 export const KIRO_DESKTOP_USER_AGENT = "Kiro-Desktop/0.2.13 (darwin; arm64)";
@@ -126,7 +130,7 @@ export async function loginKiro(
   callbacks: OAuthLoginCallbacks,
   preferredMethod: KiroLoginMethod = "auto",
 ): Promise<OAuthCredentials> {
-  const creds = await loginKiroInternal(callbacks, preferredMethod);
+  const creds = await withKiroAccountIdentity((await loginKiroInternal(callbacks, preferredMethod)) as KiroCredentials);
   if (!process.env.VITEST) {
     try {
       const { updateKiroModelsCache } = await import("./models.js");
@@ -251,7 +255,10 @@ export async function loginKiroBuilderID(callbacks: OAuthLoginCallbacks): Promis
 const EXPIRES_BUFFER_MS = 5 * 60 * 1000;
 
 export async function refreshKiroToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-  const refreshed = await refreshKiroTokenInternal(credentials);
+  const refreshed = await withKiroAccountIdentity(
+    (await refreshKiroTokenInternal(credentials)) as KiroCredentials,
+    credentials as KiroCredentials,
+  );
   if (!process.env.VITEST) {
     try {
       const { updateKiroModelsCache } = await import("./models.js");

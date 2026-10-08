@@ -1,6 +1,6 @@
 {
   "name": "pi-kiro-connect",
-  "version": "0.13.2",
+  "version": "0.14.0",
   "description": "Kiro (AWS CodeWhisperer/Q) provider for pi and Oh My Pi — kiro-cli-compatible login, live model catalog, credit usage",
   "type": "module",
   "main": "./dist/index.js",

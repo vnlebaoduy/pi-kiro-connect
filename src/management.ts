@@ -44,7 +44,8 @@ export interface KiroGetUsageLimitsRequest {
   profileArn?: string;
   origin: "KIRO_CLI";
   resourceType: "CREDIT";
-  isEmailRequired: false;
+  /** `true` adds the signed-in user's email to `userInfo`; usage display does not need it. */
+  isEmailRequired: boolean;
 }
 
 interface KiroListAvailableProfilesResponse {

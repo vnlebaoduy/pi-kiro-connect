@@ -996,6 +996,9 @@ function streamKiroWithUsageTracking(
           profileArn,
           agentMode: "vibe",
         };
+        // Host request hooks (`before_provider_request`) may rewrite the body;
+        // `undefined` keeps it. Run once per attempt, since each attempt rebuilds it.
+        const payload = (await options?.onPayload?.(request, model)) ?? request;
         let response!: Response;
         // Reset per outer iteration — each 403 retry gets a fresh capacity budget
         let capacityRetryCount = 0;
@@ -1036,7 +1039,7 @@ function streamKiroWithUsageTracking(
                 "x-amz-user-agent": ua,
                 "user-agent": ua,
               },
-              body: JSON.stringify(request),
+              body: JSON.stringify(payload),
               signal: responseHeaderDeadline.signal,
             });
           } catch (error) {
@@ -1053,6 +1056,13 @@ function streamKiroWithUsageTracking(
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY);
             await abortableDelay(delayMs, options?.signal);
             continue requestLoop;
+          }
+          if (options?.onResponse) {
+            const headers: Record<string, string> = {};
+            response.headers.forEach((value, name) => {
+              headers[name.toLowerCase()] = value;
+            });
+            await options.onResponse({ status: response.status, headers }, model);
           }
           if (!response.ok) {
             let errText = "";

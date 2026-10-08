@@ -29,7 +29,7 @@ Restart pi or omp afterwards.
 How each host stays current:
 
 - **pi** installs from the `release/latest` branch. Every release moves that branch to the newest version together with its prebuilt `dist/`, so `pi update --extensions` always lands on the newest release.
-- **omp** installs the exact newest tag, for example `#v0.13.1`. omp's own `omp plugin upgrade` does not pick up new commits on a branch, because Bun caches git heads. Rerunning the installer looks up the newest tag and reinstalls, which always works.
+- **omp** installs the exact newest tag, for example `#v0.14.0`. omp's own `omp plugin upgrade` does not pick up new commits on a branch, because Bun caches git heads. Rerunning the installer looks up the newest tag and reinstalls, which always works.
 
 ## Installer options
 
@@ -37,7 +37,7 @@ How each host stays current:
 |---|---|
 | *(none)* | Newest release into every detected host |
 | `--pi` / `--omp` | One host only |
-| `--version v0.13.1` | Pin a specific release; it will not follow newer ones |
+| `--version v0.14.0` | Pin a specific release; it will not follow newer ones |
 | `--uninstall` | Remove pi-kiro-connect |
 
 Pass flags through the pipe with `bash -s --`, for example `curl -fsSL …/install.sh | bash -s -- --omp`. To read the script before running it:
@@ -54,7 +54,7 @@ less install.sh && bash install.sh
 pi install git:github.com/vnlebaoduy/pi-kiro-connect@release/latest
 
 # omp: install the newest tag (see Releases); install a newer tag to update
-omp plugin install github:vnlebaoduy/pi-kiro-connect#v0.13.1
+omp plugin install github:vnlebaoduy/pi-kiro-connect#v0.14.0
 ```
 
 pi git installs never run the build, but pi loads `dist/index.js`. Point pi at a `release/…` branch, never at a plain tag or `main`, because only the release branches contain `dist/`.
@@ -87,7 +87,9 @@ Identity Center and Builder ID sign-in follow `kiro-cli` exactly:
 - **One session.** After you sign in from pi/omp, `kiro-cli` is signed in too, and the reverse also holds: an existing `kiro-cli` session is picked up without a second login. Both tools refresh the same token family, so neither one invalidates the other.
 - **Known region first.** If `kiro-cli` has already signed in to your start URL, its region is tried before any others.
 
-Signing in from pi/omp replaces the `kiro-cli` Identity Center session, as running `kiro-cli login` again would.
+Signing in from pi/omp replaces the `kiro-cli` Identity Center session, as running `kiro-cli login` again would. The reverse holds too: omp follows whichever account `kiro-cli` is signed in to. After `kiro-cli login` as another user, omp switches at its next token refresh (within about an hour). To switch right away, run `/logout` → Kiro, then `/login` → Kiro → **Use existing credentials**.
+
+Each Kiro credential records the account it belongs to (Kiro's account id and, when available, its email). `omp usage` and `omp dry-balance` show which account is in use, and signing in to the same account again updates the stored credential instead of adding a duplicate.
 
 Credentials are looked up in this order: `KIRO_API_KEY` (or `OMP_KIRO_PROVIDER_KEY` on omp), then the host's own saved login, then `kiro-cli` (social, IdC, external IdP), then the Kiro IDE (`~/.aws/sso/cache/kiro-auth-token.json`).
 
@@ -106,7 +108,7 @@ Reasoning is turned on automatically for models that support it. Use `/reasoning
 
 ## Usage and credits
 
-- **omp:** `omp usage` and `/usage` show monthly Kiro credits (used, limit, reset date), plus any free-trial bonus credits.
+- **omp:** `omp usage` and `/usage` show monthly Kiro credits (used, limit, reset date), plus any free-trial bonus credits. In `/usage`, press **Enter** for the Details tab, which shows the account, plan, and exact credit figures.
 - **pi:** an optional footer badge (for example `◆ Kiro 12%`) shows how much of the allowance is used. Turn it on in `~/.pi/agent/settings.json`:
 
 ```json

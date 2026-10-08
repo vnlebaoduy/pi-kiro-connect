@@ -294,6 +294,32 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("lets a host request hook replace the body Kiro receives", async () => {
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.stubGlobal("fetch", mockFetch);
+    const model = makeModel();
+    const onPayload = vi.fn((payload: unknown) => ({ ...(payload as object), injectedByHook: true }));
+
+    await collect(streamKiro(model, makeContext(), { apiKey: "test-token", onPayload }));
+
+    expect(onPayload).toHaveBeenCalledWith(expect.objectContaining({ agentMode: "vibe" }), model);
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).injectedByHook).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
+  it("reports the HTTP status and lower-cased headers to a host response hook", async () => {
+    const response = makeOkResponse('{"content":"Hi"}{"contextUsagePercentage":10}');
+    Object.assign(response, { status: 200, headers: new Headers({ "X-Amzn-RequestId": "req-1" }) });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(response));
+    const model = makeModel();
+    const onResponse = vi.fn();
+
+    await collect(streamKiro(model, makeContext(), { apiKey: "test-token", onResponse }));
+
+    expect(onResponse).toHaveBeenCalledWith({ status: 200, headers: { "x-amzn-requestid": "req-1" } }, model);
+    vi.unstubAllGlobals();
+  });
+
   it("emits native summarized thinking at max effort and preserves its signature", async () => {
     const mockFetch = mockFetchOk(
       '{"text":"Considering "}{"text":"divisibility"}{"signature":"opaque-signature"}{"content":"No"}{"contextUsagePercentage":10}',

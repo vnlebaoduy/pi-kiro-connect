@@ -47,7 +47,7 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)
-      [ $# -ge 2 ] || die "--version needs a value, e.g. --version v0.13.1"
+      [ $# -ge 2 ] || die "--version needs a value, e.g. --version v0.14.0"
       version="$2"; shift 2 ;;
     --version=*) version="${1#*=}"; shift ;;
     --pi) want_pi=1; shift ;;
