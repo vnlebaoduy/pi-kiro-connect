@@ -106,6 +106,10 @@ The model list is **fetched live** from Kiro's management API for your account's
 
 Reasoning is turned on automatically for models that support it. Use `/reasoning` (pi) or the thinking level (omp) to adjust it.
 
+### Web search
+
+The extension registers a `kiro_web_search` tool. Kiro runs the search on its own servers (the `InvokeMCP` operation), so results are real pages rather than a tool call the model invents. It uses the credential of the current session, and queries are limited to 200 characters. The tool appears wherever the host lists extension tools; no setting is needed.
+
 ## Usage and credits
 
 - **omp:** `omp usage` and `/usage` show monthly Kiro credits (used, limit, reset date), plus any free-trial bonus credits. In `/usage`, press **Enter** for the Details tab, which shows the account, plan, and exact credit figures.

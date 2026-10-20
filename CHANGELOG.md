@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.14.0] - 2026-10-07
+## [0.15.0] - 2026-10-18
+
+### Added
+
+- `kiro_web_search` tool, backed by Kiro's own `web_search` over the `InvokeMCP` operation (`POST /mcp`). Kiro runs the search server-side and returns real results, unlike declaring `web_search` as an ordinary tool, where the model only invents a call the caller has to fulfil. The tool searches with the credential the host resolved for the session, falls back to local `kiro-cli`/IDE discovery when there is none, cancels with the agent turn (20s deadline), and rejects empty or longer-than-200-character queries before sending. Contributed in [#1](https://github.com/vnlebaoduy/pi-kiro-connect/pull/1).
+
+
 
 ### Added
 
@@ -336,7 +342,8 @@ First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://git
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.0...v0.13.1
