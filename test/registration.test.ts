@@ -27,13 +27,23 @@ vi.mock("../src/kiro-ide.js", async () => {
 
 const mockPi = () => {
   const registerProvider = vi.fn();
-  return { pi: { registerProvider, on: vi.fn() } as unknown as ExtensionAPI, registerProvider };
+  const registerTool = vi.fn();
+  return {
+    pi: { registerProvider, registerTool, on: vi.fn() } as unknown as ExtensionAPI,
+    registerProvider,
+    registerTool,
+  };
 };
 
 /** Oh My Pi's ExtensionAPI additionally injects its schema modules, e.g. `typebox`. */
 const mockOmpPi = () => {
   const registerProvider = vi.fn();
-  return { pi: { registerProvider, on: vi.fn(), typebox: {} } as unknown as ExtensionAPI, registerProvider };
+  const registerTool = vi.fn();
+  return {
+    pi: { registerProvider, registerTool, on: vi.fn(), typebox: {} } as unknown as ExtensionAPI,
+    registerProvider,
+    registerTool,
+  };
 };
 
 /** Minimal host store fixture — refreshKiroModels intentionally uses the Kiro file cache instead. */
@@ -248,6 +258,43 @@ describe("Feature 1: Extension Registration", () => {
     expect(config.oauth.getCliCredentials).toBe(getKiroCliCredentials);
     expect(config.oauth.getApiKey({ access: "existing-access-token" })).toBe("existing-access-token");
     expect(typeof config.oauth.fetchUsage).toBe("function");
+  });
+
+  it("registers kiro_web_search and searches with the host-resolved credential", async () => {
+    const mod = await import("../src/index.js");
+    const { pi, registerProvider, registerTool } = mockPi();
+    await mod.default(pi);
+
+    const tool = registerTool.mock.calls[0]?.[0];
+    expect(tool.name).toBe("kiro_web_search");
+
+    // The host resolves the session credential here; on OMP this is the agent.db
+    // login, which the file-based fallback cannot see.
+    const config = registerProvider.mock.calls[0][1];
+    config.oauth.getApiKey({
+      access: "host-access",
+      refresh: "rt|cid|csec|idc",
+      expires: Date.now() + 60_000,
+      region: "ap-southeast-1",
+      authMethod: "idc",
+      profileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/host",
+      clientId: "cid",
+      clientSecret: "csec",
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          error: null,
+          result: { content: [{ type: "text", text: JSON.stringify({ results: [] }) }] },
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await tool.execute("call-1", { query: "kiro news" });
+
+    const [, request] = fetchMock.mock.calls.at(-1) as [string, RequestInit];
+    expect((request.headers as Record<string, string>).Authorization).toBe("Bearer host-access");
   });
 
   it("registers a streamSimple handler", async () => {
