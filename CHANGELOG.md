@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-18
+
+### Fixed
+
+- Declare `typebox` as a host-provided peer dependency (`*`, optional) instead of a runtime dependency, and keep it external in the bundle. pi rejects an extension that lists one of its host packages under `dependencies`, because the installed copy can shadow the host module; the warning appeared on every pi start after 0.15.0 added the schema import. The host aliases `typebox` for extensions, so the bundle resolves the host copy.
+
 ## [0.15.0] - 2026-10-18
 
 ### Added
@@ -342,7 +348,8 @@ First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://git
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.1...v0.13.2

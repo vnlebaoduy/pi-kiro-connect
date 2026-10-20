@@ -118,6 +118,16 @@ describe("published package surface", () => {
     }
   });
 
+  // pi's extension loader rejects host-provided packages listed in
+  // `dependencies`: the installed copy can shadow the host's own module. Tool
+  // parameter schemas come from the host's typebox, so declare it as a peer.
+  it("takes typebox from the host instead of installing a second copy", () => {
+    expect(pkg.dependencies ?? {}).not.toHaveProperty("typebox");
+    expect(pkg.peerDependencies?.typebox).toBe("*");
+    expect(pkg.peerDependenciesMeta?.typebox?.optional).toBe(true);
+    expect(pkg.devDependencies?.typebox).toBeDefined();
+  });
+
   // esbuild only produces dist/index.js; nothing in src/ or the bundle imports
   // it. As a runtime dependency every consumer installed a full esbuild plus its
   // platform binary beside whatever esbuild its own tree already carried.
