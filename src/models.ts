@@ -11,7 +11,7 @@ import { fetchKiroModelCatalog, type KiroCatalogModel } from "./management.js";
 
 export { resolveApiRegion } from "./endpoints.js";
 
-export const KIRO_MANAGEMENT_CACHE_VERSION = 2;
+export const KIRO_MANAGEMENT_CACHE_VERSION = 3;
 export const KIRO_MANAGEMENT_CACHE_SOURCE = "kiro-management";
 export const KIRO_MANAGEMENT_CACHE_PATH = join(homedir(), ".pi", "agent", "kiro-management-models-cache.json");
 export const LEGACY_HOME_CACHE_PATH = join(homedir(), ".kiro-management-models-cache.json");
@@ -57,6 +57,8 @@ export interface KiroModel extends Model<"kiro-api"> {
 
 interface ManagementCacheRegion {
   region: string;
+  /** Present when the catalog was fetched for a specific profile; absent for legacy entries. */
+  profileArn?: string;
   fetchedAt: number;
   models: KiroModel[];
 }
@@ -378,7 +380,8 @@ function parseManagementCache(raw: string): ManagementModelsCache | undefined {
   for (const [region, rawEntry] of Object.entries(value.regions)) {
     if (
       !isRecord(rawEntry) ||
-      rawEntry.region !== region ||
+      typeof rawEntry.region !== "string" ||
+      rawEntry.region.length === 0 ||
       !isPositiveNumber(rawEntry.fetchedAt) ||
       !Array.isArray(rawEntry.models) ||
       rawEntry.models.length === 0 ||
@@ -399,6 +402,28 @@ function parseManagementCache(raw: string): ManagementModelsCache | undefined {
     source: KIRO_MANAGEMENT_CACHE_SOURCE,
     regions,
   };
+}
+
+/**
+ * Catalogs are per profile: two Kiro accounts in the same region can see
+ * different models. Profile-less entries (API keys, legacy caches) stay keyed by
+ * region alone.
+ */
+function managementCacheKey(region: string, profileArn?: string): string {
+  return profileArn ? `${region}#${profileArn}` : region;
+}
+
+function findManagementCacheRegion(
+  cache: ManagementModelsCache | undefined,
+  region: string,
+  profileArn?: string,
+): ManagementCacheRegion | undefined {
+  if (!cache) return undefined;
+  if (profileArn) return cache.regions[managementCacheKey(region, profileArn)];
+  // Without a profile, serve the newest catalog for the region.
+  return Object.values(cache.regions)
+    .filter((entry) => entry.region === region)
+    .sort((left, right) => right.fetchedAt - left.fetchedAt)[0];
 }
 
 function readManagementCache(): ManagementModelsCache | undefined {
@@ -570,11 +595,11 @@ export function loadCachedModelIds(): void {
   refreshKnownModelIds(readManagementCache());
 }
 
-/** Return the authenticated regional catalog, or the static list only as a pre-discovery bootstrap. */
-export function getCachedModels(region: string): KiroModel[] {
+/** Return the authenticated catalog for the region (and profile, when known), or the static bootstrap list. */
+export function getCachedModels(region: string, profileArn?: string): KiroModel[] {
   const cache = readManagementCache();
   refreshKnownModelIds(cache);
-  const models = cache?.regions[region]?.models ?? kiroModels;
+  const models = findManagementCacheRegion(cache, region, profileArn)?.models ?? kiroModels;
   let changed = false;
   const corrected = models.map((model) => {
     const result = applyVerifiedCapabilities(model);
@@ -584,8 +609,8 @@ export function getCachedModels(region: string): KiroModel[] {
   return changed ? corrected : models;
 }
 
-export function isCacheStale(region: string): boolean {
-  const entry = readManagementCache()?.regions[region];
+export function isCacheStale(region: string, profileArn?: string): boolean {
+  const entry = findManagementCacheRegion(readManagementCache(), region, profileArn);
   return !entry || Date.now() - entry.fetchedAt > CACHE_MAX_AGE_MS;
 }
 
@@ -599,7 +624,15 @@ export async function updateKiroModelsCache(accessToken: string, region: string,
     regions: {},
   };
 
-  cache.regions[region] = { region, fetchedAt: Date.now(), models };
+  // Monotonic: two profiles refreshed in the same millisecond still have a
+  // definite "newest" entry for profile-less reads.
+  const newestFetchedAt = Math.max(0, ...Object.values(cache.regions).map((entry) => entry.fetchedAt));
+  cache.regions[managementCacheKey(region, profileArn)] = {
+    region,
+    ...(profileArn ? { profileArn } : {}),
+    fetchedAt: Math.max(Date.now(), newestFetchedAt + 1),
+    models,
+  };
   writeManagementCache(cache);
   refreshKnownModelIds(cache);
 }

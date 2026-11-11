@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getKiroCliSocialToken } from "../src/kiro-cli.js";
+import { getKiroCliCredentials, getKiroCliSocialToken } from "../src/kiro-cli.js";
 import { getKiroIdeCredentials } from "../src/kiro-ide.js";
 import type { KiroCredentials } from "../src/oauth.js";
 import { refreshKiroToken } from "../src/oauth.js";
@@ -70,6 +70,67 @@ describe("Feature 3: OAuth — Token Refresh", () => {
       await expect(refreshKiroToken({ refresh: "rt|c|s|idc", access: "x", expires: 0 })).rejects.toThrow(
         "Token refresh failed: 400 invalid_grant",
       );
+      vi.unstubAllGlobals();
+    });
+
+    it("does not adopt a kiro-cli token that belongs to another Kiro account", async () => {
+      // Two accounts share one OIDC client, so identity — not the client id —
+      // decides whether the CLI's session may replace this credential.
+      vi.mocked(getKiroCliCredentials).mockReturnValueOnce({
+        access: "cli-other-access",
+        refresh: "other-session|cid|sec|idc",
+        expires: Date.now() + 3_600_000,
+        clientId: "cid",
+        clientSecret: "sec",
+        region: "us-east-1",
+        authMethod: "idc",
+        accountId: "d-999.other",
+      } as KiroCredentials);
+      const mockFetch = vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ accessToken: "new_at", refreshToken: "new_rt", expiresIn: 3600 }),
+      });
+      vi.stubGlobal("fetch", mockFetch);
+
+      const creds = await refreshKiroToken({
+        refresh: "mine|cid|sec|idc",
+        access: "stale",
+        expires: 0,
+        region: "us-east-1",
+        authMethod: "idc",
+        accountId: "d-123.mine",
+      } as KiroCredentials);
+
+      expect(creds.access).toBe("new_at");
+      expect(mockFetch.mock.calls.some(([url]) => String(url).endsWith("/token"))).toBe(true);
+      vi.unstubAllGlobals();
+    });
+
+    it("adopts a kiro-cli token for the same sign-in without a token request", async () => {
+      vi.mocked(getKiroCliCredentials).mockReturnValueOnce({
+        access: "cli-same-access",
+        refresh: "mine|cid|sec|idc",
+        expires: Date.now() + 3_600_000,
+        clientId: "cid",
+        clientSecret: "sec",
+        region: "us-east-1",
+        authMethod: "idc",
+        accountId: "d-123.mine",
+      } as KiroCredentials);
+      const mockFetch = vi.fn();
+      vi.stubGlobal("fetch", mockFetch);
+
+      const creds = await refreshKiroToken({
+        refresh: "mine|cid|sec|idc",
+        access: "stale",
+        expires: 0,
+        region: "us-east-1",
+        authMethod: "idc",
+        accountId: "d-123.mine",
+      } as KiroCredentials);
+
+      expect(creds.access).toBe("cli-same-access");
+      expect(mockFetch).not.toHaveBeenCalled();
       vi.unstubAllGlobals();
     });
 

@@ -8,7 +8,7 @@
 // to the interactive login flow in login.ts (Feature 10).
 
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
-import { withKiroAccountIdentity } from "./account-identity.js";
+import { isSameKiroSession, withKiroAccountIdentity } from "./account-identity.js";
 import { formatSafeError } from "./debug.js";
 import { resolveApiRegion } from "./endpoints.js";
 import { getKiroIdeCredentials, getKiroIdeCredentialsAllowExpired } from "./kiro-ide.js";
@@ -294,6 +294,14 @@ async function refreshKiroTokenInternal(credentials: OAuthCredentials): Promise<
     const cliCreds = getKiroCliCredentialsAllowExpired();
     return cliCreds?.authMethod === "idc" ? cliCreds : undefined;
   };
+  /**
+   * A kiro-cli or IDE credential replaces the stored one only when it is the
+   * same sign-in. With several Kiro accounts in the host, the CLI holds whichever
+   * account was signed in last, and adopting it unconditionally would serve that
+   * account's quota under this credential's identity.
+   */
+  const adoptIfSameSession = async (candidate: KiroCredentials | undefined): Promise<KiroCredentials | undefined> =>
+    candidate && (await isSameKiroSession(credentials as KiroCredentials, candidate)) ? candidate : undefined;
 
   // API key credentials are long-lived bearer tokens — there is nothing to
   // refresh. Return them unchanged so the same key keeps being used.
@@ -305,12 +313,12 @@ async function refreshKiroTokenInternal(credentials: OAuthCredentials): Promise<
   // credential refresh — never replace a stored social/desktop session with
   // the IDE's potentially unrelated account (auth-family guard, #142).
   if (credentialAuthMethod === "idc") {
-    const ideCreds = getKiroIdeCredentials();
+    const ideCreds = await adoptIfSameSession(getKiroIdeCredentials());
     if (ideCreds) return ideCreds;
   }
 
-  // Prefer a fresh CLI token only when it belongs to the same auth family.
-  const preCheckCreds = getValidCliCredentials();
+  // Prefer a fresh CLI token only when it is the same sign-in.
+  const preCheckCreds = await adoptIfSameSession(getValidCliCredentials());
   if (preCheckCreds) return preCheckCreds;
 
   try {
@@ -323,16 +331,20 @@ async function refreshKiroTokenInternal(credentials: OAuthCredentials): Promise<
   } catch (refreshError) {
     // The CLI may have rotated the refresh token between the pre-check and
     // network call. Re-read only the matching auth family.
-    const retryCreds = getValidCliCredentials();
+    const retryCreds = await adoptIfSameSession(getValidCliCredentials());
     if (retryCreds) return retryCreds;
 
-    // The CLI may have a newer refresh token with an expired access token.
+    // The CLI may hold this same session with an expired access token and a
+    // rotated refresh token; a token from another account is never used.
     const expiredCliCreds = getExpiredCliCredentials();
     if (expiredCliCreds && expiredCliCreds.refresh !== credentials.refresh) {
       try {
-        const refreshedFromCli = await refreshKiroTokenDirect(expiredCliCreds);
-        saveKiroCliCredentials(refreshedFromCli as KiroCredentials);
-        return refreshedFromCli;
+        const sameSession = await adoptIfSameSession(expiredCliCreds);
+        if (sameSession) {
+          const refreshedFromCli = await refreshKiroTokenDirect(sameSession);
+          saveKiroCliCredentials(refreshedFromCli as KiroCredentials);
+          return refreshedFromCli;
+        }
       } catch {
         // Also failed, continue to remaining fallbacks
       }

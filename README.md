@@ -87,9 +87,31 @@ Identity Center and Builder ID sign-in follow `kiro-cli` exactly:
 - **One session.** After you sign in from pi/omp, `kiro-cli` is signed in too, and the reverse also holds: an existing `kiro-cli` session is picked up without a second login. Both tools refresh the same token family, so neither one invalidates the other.
 - **Known region first.** If `kiro-cli` has already signed in to your start URL, its region is tried before any others.
 
-Signing in from pi/omp replaces the `kiro-cli` Identity Center session, as running `kiro-cli login` again would. The reverse holds too: omp follows whichever account `kiro-cli` is signed in to. After `kiro-cli login` as another user, omp switches at its next token refresh (within about an hour). To switch right away, run `/logout` → Kiro, then `/login` → Kiro → **Use existing credentials**.
+Signing in from pi/omp replaces the `kiro-cli` Identity Center session, as running `kiro-cli login` again would.
 
 Each Kiro credential records the account it belongs to (Kiro's account id and, when available, its email). `omp usage` and `omp dry-balance` show which account is in use, and signing in to the same account again updates the stored credential instead of adding a duplicate.
+
+### Several Kiro accounts
+
+`/login` → Kiro adds an account; it does not replace the existing one. omp ranks and rotates them, and a running session stays on the account it started with. With several accounts, the `kiro-cli` session is adopted only when it is the **same sign-in**: a kiro-cli login as another user no longer hijacks a stored account, and refreshing one account never writes over kiro-cli's session for another.
+
+To make omp switch to whatever `kiro-cli` is signed in to right now, run `/logout` → Kiro, then `/login` → Kiro → **Use existing credentials**. To prefer one account, list the identities and set a policy:
+
+```bash
+omp usage accounts          # prints identity keys such as account:d-…
+```
+
+```yaml
+# ~/.omp/agent/config.yml
+auth:
+  accountPolicies:
+    - provider: kiro
+      account: { email: you@example.com }   # or { accountId: d-… }
+      priority: 10                          # higher wins among healthy accounts
+      reservePct: 20                         # keep 20% of this account unspent
+```
+
+Policies choose the account for **new** sessions; a running session keeps its account until it is blocked or out of quota. Each profile keeps its own model catalog, so two accounts in one region no longer overwrite each other's list.
 
 Credentials are looked up in this order: `KIRO_API_KEY` (or `OMP_KIRO_PROVIDER_KEY` on omp), then the host's own saved login, then `kiro-cli` (social, IdC, external IdP), then the Kiro IDE (`~/.aws/sso/cache/kiro-auth-token.json`).
 

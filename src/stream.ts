@@ -649,7 +649,7 @@ function streamKiroWithUsageTracking(
 
       // Trigger dynamic models cache update in the background if empty or stale
       const { isCacheStale, updateKiroModelsCache } = await import("./models.js");
-      if (!process.env.VITEST && isCacheStale(runtimeRegion)) {
+      if (!process.env.VITEST && isCacheStale(runtimeRegion, profileArn)) {
         updateKiroModelsCache(accessToken, runtimeRegion, profileArn).catch((error) => {
           console.warn(
             `[pi-kiro-connect] Failed to refresh Kiro model catalog in ${runtimeRegion}: ${formatSafeError(error)}`,

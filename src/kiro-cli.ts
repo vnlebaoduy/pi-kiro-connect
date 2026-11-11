@@ -290,6 +290,12 @@ export function saveKiroCliCredentials(creds: KiroCredentials): void {
       if (!rows[0]?.value) continue;
       const tokenData = JSON.parse(rows[0].value);
 
+      // kiro-cli holds one calendar session per IdC key. With several Kiro
+      // accounts in the host, this credential may belong to a different one, and
+      // overwriting would sign kiro-cli out of the account it is using. Its
+      // refresh token identifies the session, so write only into the same one.
+      if (creds.authMethod === "idc" && tokenData.refresh_token !== rawRefreshToken) continue;
+
       tokenData.access_token = creds.access;
       tokenData.refresh_token = rawRefreshToken;
       tokenData.expires_at = expiresAt;

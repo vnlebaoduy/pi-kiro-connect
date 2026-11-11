@@ -40,6 +40,27 @@ export async function resolveKiroAccountIdentity(
 }
 
 /**
+ * Whether `candidate` — a kiro-cli or Kiro IDE credential — is the same sign-in
+ * as `current`. An equal refresh token is the same session. Otherwise the stored
+ * account id decides; only when that is unknown does this ask Kiro. Adopting a
+ * candidate from another account is what collapsed two accounts into whichever
+ * one refreshed last.
+ */
+export async function isSameKiroSession(current: KiroCredentials, candidate: KiroCredentials): Promise<boolean> {
+  const currentToken = current.refresh.split("|")[0];
+  const candidateToken = candidate.refresh.split("|")[0];
+  if (currentToken && currentToken === candidateToken) return true;
+  // Credentials stored before identities were recorded cannot be told apart;
+  // keep the historical adoption so an upgraded host still recovers a rotated
+  // CLI token. Once either side carries an account, it must match.
+  if (!current.accountId && !candidate.accountId) return true;
+  if (candidate.accountId) return Boolean(current.accountId) && candidate.accountId === current.accountId;
+  if (!current.accountId) return false;
+  const identity = await resolveKiroAccountIdentity(candidate);
+  return Boolean(identity && identity.accountId === current.accountId);
+}
+
+/**
  * Stamp `credential` with its account. A credential still on the same refresh
  * token is the same sign-in session, so it keeps the identity it carried. A
  * different refresh token — a new login, or a kiro-cli session that switched

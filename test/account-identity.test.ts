@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { withKiroAccountIdentity } from "../src/account-identity.js";
+import { isSameKiroSession, withKiroAccountIdentity } from "../src/account-identity.js";
 import { getUsageLimits } from "../src/management.js";
 import type { KiroCredentials } from "../src/oauth.js";
 
@@ -78,6 +78,43 @@ describe("withKiroAccountIdentity", () => {
     const key = { ...idcCredential("ksk_x"), authMethod: "apikey" as const };
 
     await expect(withKiroAccountIdentity(key)).resolves.toBe(key);
+    expect(usageLimits).not.toHaveBeenCalled();
+  });
+});
+
+describe("isSameKiroSession", () => {
+  it("treats an equal refresh token as the same sign-in without asking Kiro", async () => {
+    const current = idcCredential("rt-1", { accountId: "d-123.alice" });
+
+    await expect(isSameKiroSession(current, idcCredential("rt-1", { accountId: "d-999.other" }))).resolves.toBe(true);
+    expect(usageLimits).not.toHaveBeenCalled();
+  });
+
+  it("rejects a different token that carries another account", async () => {
+    const current = idcCredential("rt-1", { accountId: "d-123.alice" });
+
+    await expect(isSameKiroSession(current, idcCredential("rt-2", { accountId: "d-999.bob" }))).resolves.toBe(false);
+    expect(usageLimits).not.toHaveBeenCalled();
+  });
+
+  it("resolves a candidate with no stored account and accepts the same account", async () => {
+    usageLimits.mockResolvedValueOnce({ userInfo: { userId: "d-123.alice", email: "alice@example.com" } });
+
+    await expect(isSameKiroSession(idcCredential("rt-1", { accountId: "d-123.alice" }), idcCredential("rt-2"))).resolves.toBe(
+      true,
+    );
+    expect(usageLimits).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves an unidentified candidate and rejects it when the lookup fails", async () => {
+    usageLimits.mockRejectedValueOnce(new Error("network down"));
+    const current = idcCredential("rt-1", { accountId: "d-123.alice" });
+
+    await expect(isSameKiroSession(current, idcCredential("rt-2"))).resolves.toBe(false);
+  });
+
+  it("keeps legacy adoption when neither side records an account", async () => {
+    await expect(isSameKiroSession(idcCredential("rt-1"), idcCredential("rt-2"))).resolves.toBe(true);
     expect(usageLimits).not.toHaveBeenCalled();
   });
 });

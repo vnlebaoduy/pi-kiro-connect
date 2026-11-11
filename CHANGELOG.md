@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.15.1] - 2026-10-18
+## [0.16.0] - 2026-11-11
+
+### Changed
+
+- Kiro Identity Center accounts are now independent in one host. Refresh adopts a `kiro-cli` or Kiro IDE credential only when it is the same sign-in — an equal refresh token, or a matching account id — so a `kiro-cli login` as another user no longer replaces the account a stored credential belongs to. Credentials from before identities were recorded keep the old behaviour, since they cannot be told apart.
+- Refreshed tokens are written back into `kiro-cli` only inside the same session. Two IdC accounts share one OIDC client, so the previous client-id check could not separate them, and a refresh of one account signed the CLI out of the other.
+- The model catalog cache is keyed by profile ARN as well as region (`version: 3`, which retires older cache files). Two accounts in the same region no longer overwrite each other's model list; a read without a profile serves the newest entry for the region.
+
+
 
 ### Fixed
 
@@ -348,7 +356,8 @@ First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://git
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.13.2...v0.14.0

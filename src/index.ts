@@ -129,7 +129,7 @@ async function refreshCatalog(
 
   if (context.signal?.aborted) return [];
 
-  if (accessToken && context.allowNetwork && (context.force || isCacheStale(region))) {
+  if (accessToken && context.allowNetwork && (context.force || isCacheStale(region, oauthCredential?.profileArn))) {
     try {
       await updateKiroModelsCache(accessToken, region, oauthCredential?.profileArn);
     } catch (error) {
@@ -138,7 +138,7 @@ async function refreshCatalog(
     }
   }
 
-  return getCachedModels(region);
+  return getCachedModels(region, oauthCredential?.profileArn);
 }
 
 /**
@@ -271,9 +271,9 @@ export default function (pi: ExtensionAPI) {
       modifyModels: (models: Model<Api>[], cred: OAuthCredentials) => {
         oauthForCatalog = cred as KiroCredentials;
         const apiRegion = resolveApiRegion((cred as KiroCredentials).region);
-        const cachedKiro = getCachedModels(apiRegion);
-        const nonKiro = models.filter((m: Model<Api>) => m.provider !== "kiro");
         const credentialProfileArn = (cred as KiroCredentials).profileArn;
+        const cachedKiro = getCachedModels(apiRegion, credentialProfileArn);
+        const nonKiro = models.filter((m: Model<Api>) => m.provider !== "kiro");
         const modifiedKiro = cachedKiro.map((m: Model<Api>) => ({
           ...m,
           baseUrl: getKiroEndpoints(apiRegion).runtime,

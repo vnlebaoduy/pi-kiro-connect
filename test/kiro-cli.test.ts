@@ -80,7 +80,7 @@ describe("tryKiroCliToken (#110)", () => {
 });
 
 describe("saveKiroCliCredentials", () => {
-  function makeHomeWithKiroCliDb(): string {
+  function makeHomeWithKiroCliDb(refreshToken = "new-refresh"): string {
     tempDir = mkdtempSync(join(tmpdir(), "kiro-cli-test-"));
     vi.mocked(homedir).mockReturnValue(tempDir);
     vi.mocked(platform).mockReturnValue("linux");
@@ -94,7 +94,7 @@ describe("saveKiroCliCredentials", () => {
       "kirocli:odic:token",
       JSON.stringify({
         access_token: "cli-access",
-        refresh_token: "cli-refresh",
+        refresh_token: refreshToken,
         region: "ap-southeast-1",
         expires_at: new Date(Date.now() - 1000).toISOString(),
       }),
@@ -132,7 +132,17 @@ describe("saveKiroCliCredentials", () => {
     saveKiroCliCredentials({ ...cliClientCreds, refresh: "new-refresh|pi-client|secret|idc", clientId: "pi-client" });
     const stored = tryKiroCliToken(dbPath, "kirocli:odic:token", "idc", true);
     expect(stored?.access).toBe("cli-access");
-    expect(stored?.refresh).toBe("cli-refresh|cli-client|cli-secret|idc");
+    expect(stored?.refresh).toBe("new-refresh|cli-client|cli-secret|idc");
+  });
+
+  it("leaves kiro-cli signed in to its own account when this credential is a different session", () => {
+    // Two Kiro accounts share one OIDC client, so the client check alone cannot
+    // tell them apart; overwriting here would sign kiro-cli out of its account.
+    const dbPath = makeHomeWithKiroCliDb("other-session");
+    saveKiroCliCredentials(cliClientCreds);
+    const stored = tryKiroCliToken(dbPath, "kirocli:odic:token", "idc", true);
+    expect(stored?.access).toBe("cli-access");
+    expect(stored?.refresh).toBe("other-session|cli-client|cli-secret|idc");
   });
 });
 

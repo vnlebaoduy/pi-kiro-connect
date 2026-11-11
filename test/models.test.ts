@@ -236,10 +236,10 @@ describe("Feature 2: Model Definitions", () => {
   });
 
   describe("management model cache", () => {
-    it("uses ~/.pi/agent as the primary version 2 cache location", () => {
+    it("uses ~/.pi/agent as the primary version 3 cache location", () => {
       expect(KIRO_MANAGEMENT_CACHE_PATH).toBe(join(homedir(), ".pi", "agent", "kiro-management-models-cache.json"));
       expect(LEGACY_HOME_CACHE_PATH).toBe(join(homedir(), ".kiro-management-models-cache.json"));
-      expect(KIRO_MANAGEMENT_CACHE_VERSION).toBe(2);
+      expect(KIRO_MANAGEMENT_CACHE_VERSION).toBe(3);
     });
 
     it("accepts the versioned cache and treats its regional catalog as authoritative", async () => {
@@ -257,22 +257,41 @@ describe("Feature 2: Model Definitions", () => {
         version: KIRO_MANAGEMENT_CACHE_VERSION,
         source: KIRO_MANAGEMENT_CACHE_SOURCE,
         regions: {
-          [TEST_REGION]: {
+          [`${TEST_REGION}#${PROFILE_ARN}`]: {
             region: TEST_REGION,
+            profileArn: PROFILE_ARN,
             fetchedAt: expect.any(Number),
           },
         },
       });
       expect(serialized).not.toContain("secret-access-token");
-      expect(serialized).not.toContain(PROFILE_ARN);
 
-      const cachedModels = getCachedModels(TEST_REGION);
+      const cachedModels = getCachedModels(TEST_REGION, PROFILE_ARN);
       expect(cachedModels.map((model) => model.id)).toEqual(
         catalogFixture.map((model) => model.modelId.replace(/(\d)\.(\d)/g, "$1-$2")),
       );
       expect(cachedModels.some((model) => model.id === "auto")).toBe(false);
       expect(resolveKiroModel("openai-gpt-5-6")).toBe("openai-gpt-5.6");
-      expect(isCacheStale(TEST_REGION)).toBe(false);
+      expect(isCacheStale(TEST_REGION, PROFILE_ARN)).toBe(false);
+      expect(isCacheStale(TEST_REGION, "arn:aws:codewhisperer:test-region-1:123456789012:profile/other")).toBe(true);
+    });
+
+    it("keeps a separate catalog per profile in the same region", async () => {
+      const otherProfile = "arn:aws:codewhisperer:test-region-1:123456789012:profile/other";
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ models: [{ modelId: "claude-opus-4.6" }] }) })
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ models: [{ modelId: "claude-sonnet-4.6" }] }) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await updateKiroModelsCache("token-a", TEST_REGION, PROFILE_ARN);
+      await updateKiroModelsCache("token-b", TEST_REGION, otherProfile);
+
+      // Two Kiro accounts in one region must not overwrite each other's catalog.
+      expect(getCachedModels(TEST_REGION, PROFILE_ARN).map((model) => model.id)).toEqual(["claude-opus-4-6"]);
+      expect(getCachedModels(TEST_REGION, otherProfile).map((model) => model.id)).toEqual(["claude-sonnet-4-6"]);
+      // Without a profile, the newest entry for the region is served.
+      expect(getCachedModels(TEST_REGION).map((model) => model.id)).toEqual(["claude-sonnet-4-6"]);
     });
 
     it("repairs stale Luna image metadata in memory without rewriting the cache", () => {
