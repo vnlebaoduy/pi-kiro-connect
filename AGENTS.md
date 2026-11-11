@@ -104,6 +104,7 @@ Tag `vX.Y.Z` matching `package.json`. `.github/workflows/release.yml` verifies, 
 - `kiro-cli.ts` reads/writes kiro-cli's SQLite DB via `node:sqlite`, falling back to the `sqlite3` CLI
 - Output token count is estimated (`content.length / 4`), not from the API
 - `contextUsagePercentage` is the only usage metric Kiro provides; input tokens are back-calculated
+- Kiro caches prompt prefixes automatically — `cachePoint` markers add nothing (verified four ways), and `cacheRead`/`cacheWrite` stay 0 on models that omit `metadataEvent` (Opus 5.5), so judge caching by credits, not counters
 - Social login (Google/GitHub) requires `kiro-cli` to be installed — pi delegates the auth flow to it
 
 ## Maintaining this file

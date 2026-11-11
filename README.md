@@ -129,6 +129,8 @@ The extension registers a `kiro_web_search` tool. Kiro runs the search on its ow
 
 `estimateDollarValue` converts credits to USD at `$0.04` per credit by default (override it with `usdPerCredit`). `estimateCacheUsage` marks prompt tokens repeated from the previous turn as cache reads. Both are estimates, not billing data.
 
+**Prompt caching is automatic.** Kiro reuses a matching prompt prefix on its own; sending kiro-cli's `cachePoint` marker changed nothing across four live runs. On an identical 44k-token prefix, the second request billed `0.148` credits against `0.544` for the first, about 73% less. Models that do not emit `metadataEvent` (Claude Opus 5.5 at the time of writing) report `usage.cacheRead` and `cacheWrite` as `0` even when the cache was hit, so those counters cannot tell whether caching happened. Compare credits instead.
+
 > Migrating from `pi-provider-kiro`: rename the `"pi-provider-kiro"` key in `settings.json` to `"pi-kiro-connect"`.
 
 ## Troubleshooting
