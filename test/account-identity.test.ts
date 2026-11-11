@@ -100,9 +100,9 @@ describe("isSameKiroSession", () => {
   it("resolves a candidate with no stored account and accepts the same account", async () => {
     usageLimits.mockResolvedValueOnce({ userInfo: { userId: "d-123.alice", email: "alice@example.com" } });
 
-    await expect(isSameKiroSession(idcCredential("rt-1", { accountId: "d-123.alice" }), idcCredential("rt-2"))).resolves.toBe(
-      true,
-    );
+    await expect(
+      isSameKiroSession(idcCredential("rt-1", { accountId: "d-123.alice" }), idcCredential("rt-2")),
+    ).resolves.toBe(true);
     expect(usageLimits).toHaveBeenCalledTimes(1);
   });
 

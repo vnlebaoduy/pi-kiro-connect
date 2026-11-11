@@ -112,17 +112,42 @@ export class KiroManagementHttpError extends Error {
  * attempt. HTTP errors are never retried here; callers own those semantics.
  */
 const TRANSPORT_RETRY_DELAY_MS = 250;
+/**
+ * Profile discovery runs before every runtime request, so an unreachable
+ * management host would otherwise stall a turn for as long as the socket lives.
+ * A timeout fails fast instead; it is not retried, because the request may
+ * already have been served.
+ */
+const MANAGEMENT_TIMEOUT_MS = 10_000;
+
+function managementDeadline(init: RequestInit): AbortSignal {
+  const timeout = AbortSignal.timeout(MANAGEMENT_TIMEOUT_MS);
+  return init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.name === "TimeoutError";
+}
+
+function managementTimeoutError(operation: string, region: string, cause: unknown): Error {
+  return new Error(
+    `Kiro management ${operation} request timed out after ${MANAGEMENT_TIMEOUT_MS / 1000}s in ${region}`,
+    { cause },
+  );
+}
 
 async function fetchManagement(url: string, init: RequestInit, operation: string, region: string): Promise<Response> {
   try {
-    return await fetch(url, init);
+    return await fetch(url, { ...init, signal: managementDeadline(init) });
   } catch (error) {
+    if (isTimeoutError(error)) throw managementTimeoutError(operation, region, error);
     debugLog("management.transportRetry", { operation, region, error: formatSafeError(error) });
   }
   await sleep(TRANSPORT_RETRY_DELAY_MS);
   try {
-    return await fetch(url, init);
+    return await fetch(url, { ...init, signal: managementDeadline(init) });
   } catch (error) {
+    if (isTimeoutError(error)) throw managementTimeoutError(operation, region, error);
     // Keep the transport reason in the message: it is the only diagnostic a
     // host shows, and hosts classify retryable failures from this text.
     throw new Error(`Kiro management ${operation} request failed in ${region}: ${formatSafeError(error)}`, {

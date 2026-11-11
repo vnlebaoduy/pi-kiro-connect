@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-11
+
+### Fixed
+
+- A Kiro management request now fails after 10 seconds instead of waiting on the socket. Profile discovery runs before every runtime request, so an unreachable `management.<region>.kiro.dev` could stall a turn indefinitely. Timeouts are not retried, because the request may already have been served; transport failures keep their single retry.
+- `kiro_web_search` now returns at most five results with `title`, `url`, `domain` and a snippet clipped to 300 characters, instead of dumping Kiro's full payload into the agent context. The tool details still report the total hit count.
+
 ## [0.16.0] - 2026-11-11
 
 ### Changed
@@ -356,7 +363,8 @@ First release as **pi-kiro-connect**, forked from [pi-provider-kiro](https://git
 
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
-[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/vnlebaoduy/pi-kiro-connect/compare/v0.14.0...v0.15.0

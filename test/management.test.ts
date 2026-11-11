@@ -403,6 +403,18 @@ describe("Kiro management control plane", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("fails fast when the management host never answers", async () => {
+    const timeout = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    const fetchMock = vi.fn().mockRejectedValue(timeout);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(resolveKiroProfileArn(auth)).rejects.toThrow(
+      "Kiro management ListAvailableProfiles request timed out after 10s in us-east-1",
+    );
+    // A timeout is not retried: the request may already have been served.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the primary region's 403 when the fallback region is unreachable (#107)", async () => {
     const fetchMock = vi
       .fn()

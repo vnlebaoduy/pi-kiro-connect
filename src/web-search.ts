@@ -16,6 +16,40 @@ export interface KiroWebSearchResult {
   [key: string]: unknown;
 }
 
+/** Kiro can return ten long results; the model needs the gist, not the payload. */
+export const KIRO_WEB_SEARCH_MAX_RESULTS = 5;
+export const KIRO_WEB_SEARCH_MAX_SNIPPET_CHARS = 300;
+
+export interface KiroWebSearchDigest {
+  title: string;
+  url: string;
+  domain: string;
+  snippet: string;
+}
+
+function asText(value: unknown): string {
+  if (typeof value === "string") return value;
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function clip(value: string, limit: number): string {
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+/**
+ * Bound what a search adds to the agent context: five results, short snippets,
+ * and no provider-specific extras. Callers that need the raw payload should use
+ * `invokeKiroWebSearch` directly.
+ */
+export function digestKiroWebSearchResults(results: readonly KiroWebSearchResult[]): KiroWebSearchDigest[] {
+  return results.slice(0, KIRO_WEB_SEARCH_MAX_RESULTS).map((result) => ({
+    title: clip(asText(result.title), 200),
+    url: clip(asText(result.url), 500),
+    domain: clip(asText(result.domain), 200),
+    snippet: clip(asText(result.snippet), KIRO_WEB_SEARCH_MAX_SNIPPET_CHARS),
+  }));
+}
+
 export interface KiroWebSearchAuth {
   accessToken: string;
   region: string;

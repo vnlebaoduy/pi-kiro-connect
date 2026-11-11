@@ -130,7 +130,7 @@ Reasoning is turned on automatically for models that support it. Use `/reasoning
 
 ### Web search
 
-The extension registers a `kiro_web_search` tool. Kiro runs the search on its own servers (the `InvokeMCP` operation), so results are real pages rather than a tool call the model invents. It uses the credential of the current session, and queries are limited to 200 characters. The tool appears wherever the host lists extension tools; no setting is needed.
+The extension registers a `kiro_web_search` tool. Kiro runs the search on its own servers (the `InvokeMCP` operation), so results are real pages rather than a tool call the model invents. It uses the credential of the current session, and queries are limited to 200 characters. A result set is trimmed to five hits with short snippets, so one search cannot flood the context. The tool appears wherever the host lists extension tools; no setting is needed.
 
 ## Usage and credits
 

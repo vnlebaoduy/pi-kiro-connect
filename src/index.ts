@@ -21,7 +21,7 @@ import { getPiHostKiroCredentials } from "./pi-auth-store.js";
 import { createKiroStream } from "./stream.js";
 import { fetchKiroUsage } from "./usage.js";
 import { loadKiroUsageTracking } from "./usage-tracking.js";
-import { invokeKiroWebSearch } from "./web-search.js";
+import { digestKiroWebSearchResults, invokeKiroWebSearch } from "./web-search.js";
 
 export { resolveApiRegion } from "./endpoints.js";
 export type { KiroProviderAttempts } from "./errors.js";
@@ -199,9 +199,10 @@ function registerKiroWebSearchTool(pi: ExtensionAPI, resolveCredential: () => Ki
         params.query,
         signal,
       );
+      const digest = digestKiroWebSearchResults(results);
       return {
-        content: [{ type: "text" as const, text: JSON.stringify({ results }, null, 2) }],
-        details: { query: params.query, resultCount: results.length },
+        content: [{ type: "text" as const, text: JSON.stringify({ results: digest }, null, 2) }],
+        details: { query: params.query, resultCount: results.length, returned: digest.length },
       };
     },
   });

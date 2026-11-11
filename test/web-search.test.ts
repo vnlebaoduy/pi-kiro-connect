@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { invokeKiroWebSearch, KIRO_WEB_SEARCH_MAX_QUERY_LENGTH, KiroWebSearchError } from "../src/web-search.js";
+import {
+  digestKiroWebSearchResults,
+  invokeKiroWebSearch,
+  KIRO_WEB_SEARCH_MAX_QUERY_LENGTH,
+  KIRO_WEB_SEARCH_MAX_RESULTS,
+  KIRO_WEB_SEARCH_MAX_SNIPPET_CHARS,
+  KiroWebSearchError,
+} from "../src/web-search.js";
 
 const auth = {
   accessToken: "test-access-token",
@@ -137,5 +144,36 @@ describe("Kiro web_search (InvokeMCP)", () => {
     await invokeKiroWebSearch(auth, "q", new AbortController().signal);
 
     expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+describe("digestKiroWebSearchResults", () => {
+  const result = (index: number, snippet = `snippet ${index}`) => ({
+    title: `Title ${index}`,
+    url: `https://example.com/${index}`,
+    snippet,
+    publishedDate: index,
+    domain: "example.com",
+    providerPayload: { big: "x".repeat(1000) },
+  });
+
+  it("returns at most five results with only the fields the model needs", () => {
+    const digest = digestKiroWebSearchResults(Array.from({ length: 8 }, (_, index) => result(index)));
+
+    expect(digest).toHaveLength(KIRO_WEB_SEARCH_MAX_RESULTS);
+    expect(digest[0]).toEqual({
+      title: "Title 0",
+      url: "https://example.com/0",
+      domain: "example.com",
+      snippet: "snippet 0",
+    });
+    expect(digest[0]).not.toHaveProperty("providerPayload");
+  });
+
+  it("clips long snippets so one search cannot flood the context", () => {
+    const [digest] = digestKiroWebSearchResults([result(0, "y".repeat(KIRO_WEB_SEARCH_MAX_SNIPPET_CHARS + 500))]);
+
+    expect(digest.snippet).toHaveLength(KIRO_WEB_SEARCH_MAX_SNIPPET_CHARS);
+    expect(digest.snippet.endsWith("…")).toBe(true);
   });
 });

@@ -281,7 +281,10 @@ describe("Feature 2: Model Definitions", () => {
       const fetchMock = vi
         .fn()
         .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ models: [{ modelId: "claude-opus-4.6" }] }) })
-        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ models: [{ modelId: "claude-sonnet-4.6" }] }) });
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ models: [{ modelId: "claude-sonnet-4.6" }] }),
+        });
       vi.stubGlobal("fetch", fetchMock);
 
       await updateKiroModelsCache("token-a", TEST_REGION, PROFILE_ARN);
