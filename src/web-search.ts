@@ -16,8 +16,8 @@ export interface KiroWebSearchResult {
   [key: string]: unknown;
 }
 
-/** Kiro can return ten long results; the model needs the gist, not the payload. */
-export const KIRO_WEB_SEARCH_MAX_RESULTS = 5;
+/** Kiro returns up to ten results; keep all of them, but strip the payload. */
+export const KIRO_WEB_SEARCH_MAX_RESULTS = 10;
 export const KIRO_WEB_SEARCH_MAX_SNIPPET_CHARS = 300;
 
 export interface KiroWebSearchDigest {

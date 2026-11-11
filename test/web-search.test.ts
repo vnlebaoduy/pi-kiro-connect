@@ -157,8 +157,8 @@ describe("digestKiroWebSearchResults", () => {
     providerPayload: { big: "x".repeat(1000) },
   });
 
-  it("returns at most five results with only the fields the model needs", () => {
-    const digest = digestKiroWebSearchResults(Array.from({ length: 8 }, (_, index) => result(index)));
+  it("returns up to ten results with only the fields the model needs", () => {
+    const digest = digestKiroWebSearchResults(Array.from({ length: 12 }, (_, index) => result(index)));
 
     expect(digest).toHaveLength(KIRO_WEB_SEARCH_MAX_RESULTS);
     expect(digest[0]).toEqual({
